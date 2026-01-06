@@ -25,6 +25,12 @@ from serving.logging_lib.flags import flag_utils
 
 # Endpoint configuration flags.
 
+MAX_PARALLEL_DOWNLOAD_WORKERS_FLAG = flags.DEFINE_integer(
+    'max_parallel_download_workers',
+    int(os.environ.get('MAX_PARALLEL_DOWNLOAD_WORKERS', 2)),
+    'Max number of parallel workers to use when downloading instance data.',
+)
+
 THREAD_POOL_MAX_WORKERS_FLAG = flags.DEFINE_integer(
     'thread_pool_max_workers',
     int(os.environ.get('THREAD_POOL_MAX_WORKERS', 4)),

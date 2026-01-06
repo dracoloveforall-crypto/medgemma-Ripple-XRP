@@ -15,7 +15,6 @@
 
 import io
 import os
-import tempfile
 from typing import Any, Mapping
 
 from absl.testing import absltest
@@ -32,6 +31,7 @@ import pydicom
 
 from data_accessors import data_accessor_const
 from data_accessors import data_accessor_errors
+from data_accessors.local_file_handlers import abstract_handler
 from data_accessors.local_file_handlers import wsi_dicom_handler
 from data_accessors.utils import dicom_source_utils
 from data_accessors.utils import patch_coordinate
@@ -72,7 +72,11 @@ class WsiDicomHandlerTest(parameterized.TestCase):
 
   def test_wsi_dicom_handler_load_whole_image(self):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-    img = list(dicom_handler.process_file([], {}, _wsi_dicom_file_path()))
+    img = list(
+        dicom_handler.process_files(
+            [], {}, abstract_handler.InputFileIterator([_wsi_dicom_file_path()])
+        )
+    )
     self.assertLen(img, 1)
     self.assertEqual(img[0].shape, (700, 1152, 3))
     with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
@@ -82,7 +86,11 @@ class WsiDicomHandlerTest(parameterized.TestCase):
       self,
   ):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-    img = list(dicom_handler.process_file([], {}, _wsi_dicom_file_path()))
+    img = list(
+        dicom_handler.process_files(
+            [], {}, abstract_handler.InputFileIterator([_wsi_dicom_file_path()])
+        )
+    )
     with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
       with dicom_store_mock.MockDicomStores(
           _MOCK_DICOM_STORE_PATH
@@ -115,7 +123,13 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   ])
   def test_wsi_dicom_handler_get_patches(self, patches):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-    imgs = list(dicom_handler.process_file(patches, {}, _wsi_dicom_file_path()))
+    imgs = list(
+        dicom_handler.process_files(
+            patches,
+            {},
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
+        )
+    )
     self.assertLen(imgs, len(patches))
     with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
       expected_img = np.asarray(expected_img)
@@ -145,7 +159,13 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   ])
   def test_wsi_dicom_handler_get_patches_matches_ez_wsi_result(self, patches):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-    imgs = list(dicom_handler.process_file(patches, {}, _wsi_dicom_file_path()))
+    imgs = list(
+        dicom_handler.process_files(
+            patches,
+            {},
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
+        )
+    )
     self.assertLen(imgs, len(patches))
     with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
       with dicom_store_mock.MockDicomStores(
@@ -172,10 +192,10 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   ):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     imgs = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [],
             _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     self.assertLen(imgs, 1)
@@ -186,67 +206,64 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   def test_wsi_dicom_handler_icc_profile_correction_if_optical_path_embedded_profile(
       self,
   ):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        dcm.OpticalPathSequence = [pydicom.Dataset()]
-        dcm.OpticalPathSequence[0].ICCProfile = (
-            dicom_slide.get_srgb_icc_profile_bytes()
-        )
-        dcm.save_as(dcm_path)
-
-      dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-      imgs = list(
-          dicom_handler.process_file(
-              [],
-              _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
-              dcm_path,
-          )
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      dcm.OpticalPathSequence = [pydicom.Dataset()]
+      dcm.OpticalPathSequence[0].ICCProfile = (
+          dicom_slide.get_srgb_icc_profile_bytes()
       )
-      self.assertLen(imgs, 1)
-      with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
-        expected_img = np.asarray(expected_img)
-      self.assertFalse(np.array_equal(imgs[0], expected_img))
+      dcm.save_as(dcm_path)
+
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    imgs = list(
+        dicom_handler.process_files(
+            [],
+            _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
+            abstract_handler.InputFileIterator([dcm_path]),
+        )
+    )
+    self.assertLen(imgs, 1)
+    with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
+      expected_img = np.asarray(expected_img)
+    self.assertFalse(np.array_equal(imgs[0], expected_img))
 
   def test_wsi_dicom_handler_icc_profile_correction_if_embedded_profile(self):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        dcm.ICCProfile = dicom_slide.get_srgb_icc_profile_bytes()
-        dcm.save_as(dcm_path)
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      dcm.ICCProfile = dicom_slide.get_srgb_icc_profile_bytes()
+      dcm.save_as(dcm_path)
 
-      dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-      imgs = list(
-          dicom_handler.process_file(
-              [],
-              _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
-              dcm_path,
-          )
-      )
-      self.assertLen(imgs, 1)
-      with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
-        expected_img = np.asarray(expected_img)
-      self.assertFalse(np.array_equal(imgs[0], expected_img))
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    imgs = list(
+        dicom_handler.process_files(
+            [],
+            _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
+            abstract_handler.InputFileIterator([dcm_path]),
+        )
+    )
+    self.assertLen(imgs, 1)
+    with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
+      expected_img = np.asarray(expected_img)
+    self.assertFalse(np.array_equal(imgs[0], expected_img))
 
   def test_wsi_dicom_handler_icc_profile_noop_if_no_icc_profile_transform(self):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        dcm.ICCProfile = dicom_slide.get_srgb_icc_profile_bytes()
-        dcm.save_as(dcm_path)
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      dcm.ICCProfile = dicom_slide.get_srgb_icc_profile_bytes()
+      dcm.save_as(dcm_path)
 
-      dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-      imgs = list(
-          dicom_handler.process_file(
-              [],
-              {},
-              dcm_path,
-          )
-      )
-      self.assertLen(imgs, 1)
-      with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
-        expected_img = np.asarray(expected_img)
-      np.testing.assert_array_equal(imgs[0], expected_img)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    imgs = list(
+        dicom_handler.process_files(
+            [],
+            {},
+            abstract_handler.InputFileIterator([dcm_path]),
+        )
+    )
+    self.assertLen(imgs, 1)
+    with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
+      expected_img = np.asarray(expected_img)
+    np.testing.assert_array_equal(imgs[0], expected_img)
 
   def test_read_wsi_from_buffer(self):
     with io.BytesIO() as io_bytes:
@@ -254,10 +271,10 @@ class WsiDicomHandlerTest(parameterized.TestCase):
         io_bytes.write(infile.read())
       dicom_handler = wsi_dicom_handler.WsiDicomHandler()
       imgs = list(
-          dicom_handler.process_file(
+          dicom_handler.process_files(
               [],
               {},
-              io_bytes,
+              abstract_handler.InputFileIterator([io_bytes]),
           )
       )
       self.assertLen(imgs, 1)
@@ -268,10 +285,12 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   def test_read_cannot_read_wsi_from_return_empty(self):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     imgs = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [],
             {},
-            test_utils.testdata_path('image.jpeg'),
+            abstract_handler.InputFileIterator(
+                [test_utils.testdata_path('image.jpeg')]
+            ),
         )
     )
     self.assertEmpty(imgs)
@@ -282,121 +301,118 @@ class WsiDicomHandlerTest(parameterized.TestCase):
         data_accessor_errors.PatchOutsideOfImageDimensionsError
     ):
       list(
-          dicom_handler.process_file(
+          dicom_handler.process_files(
               [patch_coordinate.PatchCoordinate(1, 2, 900, 1000)],
               {},
-              _wsi_dicom_file_path(),
+              abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
           )
       )
 
   def test_read_patch_outof_bounds_disabled_does_not_raise(self):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     img = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [patch_coordinate.PatchCoordinate(1, 2, 900, 1000)],
             _mock_instance_extension_metadata(
                 {_InstanceJsonKeys.REQUIRE_PATCHES_FULLY_IN_SOURCE_IMAGE: False}
             ),
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     self.assertLen(img, 1)
     self.assertEqual(img[0].shape, (1000, 900, 3))
 
   def test_wsi_dicom_handler_decode_uncompressed_dicom(self):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
 
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        frames = wsi_dicom_handler._get_compressed_dicom_frame_bytes(dcm)
-        decoded_frames = []
-        for frame in frames:
-          result = dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
-              frame, dcm.file_meta.TransferSyntaxUID
-          )
-          decoded_frames.append(result)
-        pixel_data = np.asarray(decoded_frames).tobytes()
-        if len(pixel_data) % 2 != 0:
-          pixel_data = b'{pixeldata}\x00'
-        dcm.PixelData = pixel_data
-        dcm.PhotometricInterpretation = 'RGB'
-        dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
-        dcm.save_as(dcm_path)
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      frames = wsi_dicom_handler._get_compressed_dicom_frame_bytes(dcm)
+      decoded_frames = []
+      for frame in frames:
+        result = dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
+            frame, dcm.file_meta.TransferSyntaxUID
+        )
+        decoded_frames.append(result)
+      pixel_data = np.asarray(decoded_frames).tobytes()
+      if len(pixel_data) % 2 != 0:
+        pixel_data = b'{pixeldata}\x00'
+      dcm.PixelData = pixel_data
+      dcm.PhotometricInterpretation = 'RGB'
+      dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
+      dcm.save_as(dcm_path)
 
-      dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-      imgs = list(
-          dicom_handler.process_file(
-              [],
-              {},
-              dcm_path,
-          )
-      )
-      self.assertLen(imgs, 1)
-      with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
-        expected_img = np.asarray(expected_img)
-      np.testing.assert_array_equal(imgs[0], expected_img)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    imgs = list(
+        dicom_handler.process_files(
+            [],
+            {},
+            abstract_handler.InputFileIterator([dcm_path]),
+        )
+    )
+    self.assertLen(imgs, 1)
+    with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
+      expected_img = np.asarray(expected_img)
+    np.testing.assert_array_equal(imgs[0], expected_img)
 
   def test_wsi_dicom_handler_decode_uncompressed_dicom_monochrome2(self):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
 
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        frames = wsi_dicom_handler._get_compressed_dicom_frame_bytes(dcm)
-        decoded_frames = []
-        for frame in frames:
-          result = dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
-              frame, dcm.file_meta.TransferSyntaxUID
-          )
-          decoded_frames.append(result)
-        pixel_data = np.asarray(decoded_frames)[..., 0:1].tobytes()
-        if len(pixel_data) % 2 != 0:
-          pixel_data = b'{pixeldata}\x00'
-        dcm.PixelData = pixel_data
-        dcm.SamplesPerPixel = 1
-        dcm.PhotometricInterpretation = 'MONOCHROME2'
-        dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
-        dcm.save_as(dcm_path)
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      frames = wsi_dicom_handler._get_compressed_dicom_frame_bytes(dcm)
+      decoded_frames = []
+      for frame in frames:
+        result = dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
+            frame, dcm.file_meta.TransferSyntaxUID
+        )
+        decoded_frames.append(result)
+      pixel_data = np.asarray(decoded_frames)[..., 0:1].tobytes()
+      if len(pixel_data) % 2 != 0:
+        pixel_data = b'{pixeldata}\x00'
+      dcm.PixelData = pixel_data
+      dcm.SamplesPerPixel = 1
+      dcm.PhotometricInterpretation = 'MONOCHROME2'
+      dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
+      dcm.save_as(dcm_path)
 
-      dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-      imgs = list(
-          dicom_handler.process_file(
-              [],
-              {},
-              dcm_path,
-          )
-      )
-      self.assertLen(imgs, 1)
-      with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
-        expected_img = np.asarray(expected_img)
-      np.testing.assert_array_equal(imgs[0], expected_img[..., 0:1])
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    imgs = list(
+        dicom_handler.process_files(
+            [],
+            {},
+            abstract_handler.InputFileIterator([dcm_path]),
+        )
+    )
+    self.assertLen(imgs, 1)
+    with PIL.Image.open(_wsi_dicom_gt_path()) as expected_img:
+      expected_img = np.asarray(expected_img)
+    np.testing.assert_array_equal(imgs[0], expected_img[..., 0:1])
 
   def test_wsi_dicom_handler_decode_uncompressed_dicom_monochrome1(self):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
 
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        frames = wsi_dicom_handler._get_compressed_dicom_frame_bytes(dcm)
-        decoded_frames = []
-        for frame in frames:
-          result = dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
-              frame, dcm.file_meta.TransferSyntaxUID
-          )
-          decoded_frames.append(result)
-        pixel_data = np.asarray(decoded_frames)[..., 0:1].tobytes()
-        if len(pixel_data) % 2 != 0:
-          pixel_data = b'{pixeldata}\x00'
-        dcm.PixelData = pixel_data
-        dcm.SamplesPerPixel = 1
-        dcm.PhotometricInterpretation = 'MONOCHROME1'
-        dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
-        dcm.save_as(dcm_path)
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      frames = wsi_dicom_handler._get_compressed_dicom_frame_bytes(dcm)
+      decoded_frames = []
+      for frame in frames:
+        result = dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
+            frame, dcm.file_meta.TransferSyntaxUID
+        )
+        decoded_frames.append(result)
+      pixel_data = np.asarray(decoded_frames)[..., 0:1].tobytes()
+      if len(pixel_data) % 2 != 0:
+        pixel_data = b'{pixeldata}\x00'
+      dcm.PixelData = pixel_data
+      dcm.SamplesPerPixel = 1
+      dcm.PhotometricInterpretation = 'MONOCHROME1'
+      dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
+      dcm.save_as(dcm_path)
 
       dicom_handler = wsi_dicom_handler.WsiDicomHandler()
       imgs = list(
-          dicom_handler.process_file(
+          dicom_handler.process_files(
               [],
               {},
-              dcm_path,
+              abstract_handler.InputFileIterator([dcm_path]),
           )
       )
       self.assertLen(imgs, 1)
@@ -407,7 +423,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   def test_resized_whole_wsi(self):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     imgs = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [],
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -415,7 +431,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: 100,
                 }
             }),
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     self.assertLen(imgs, 1)
@@ -431,7 +447,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   ):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     img = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [],
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -439,7 +455,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: 100,
                 }
             }),
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
@@ -482,7 +498,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   ):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     imgs = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [patch],
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -490,7 +506,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: 100,
                 }
             }),
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     self.assertLen(imgs, 1)
@@ -526,7 +542,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   def test_resized_wsi_patches_smaller_than_original_match_ez_wsi(self, patch):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     imgs = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [patch],
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -534,7 +550,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: 100,
                 }
             }),
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     self.assertLen(imgs, 1)
@@ -578,7 +594,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   def test_resized_wsi_patches_larger_than_original(self, patch, expected_diff):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     imgs = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [patch],
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -586,7 +602,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: 1000,
                 }
             }),
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     self.assertLen(imgs, 1)
@@ -622,7 +638,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   def test_resized_wsi_patches_larger_than_original_match_ez_wsi(self, patch):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     imgs = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [patch],
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -630,7 +646,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: 1000,
                 }
             }),
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     self.assertLen(imgs, 1)
@@ -659,7 +675,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   def test_resized_wsi_patches_larger_than_original_whole_image(self):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     imgs = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [],
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -667,7 +683,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: 1000,
                 }
             }),
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     self.assertLen(imgs, 1)
@@ -681,7 +697,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   def test_resized_wsi_larger_than_original_whole_image_match_ez_wsi(self):
     dicom_handler = wsi_dicom_handler.WsiDicomHandler()
     imgs = list(
-        dicom_handler.process_file(
+        dicom_handler.process_files(
             [],
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -689,7 +705,7 @@ class WsiDicomHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: 1000,
                 }
             }),
-            _wsi_dicom_file_path(),
+            abstract_handler.InputFileIterator([_wsi_dicom_file_path()]),
         )
     )
     self.assertLen(imgs, 1)
@@ -716,73 +732,153 @@ class WsiDicomHandlerTest(parameterized.TestCase):
   def test_wsi_dicom_handler_dicom_invalid_photometric_interpretation_raises(
       self,
   ):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
 
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        frames = wsi_dicom_handler._get_compressed_dicom_frame_bytes(dcm)
-        decoded_frames = []
-        for frame in frames:
-          result = dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
-              frame, dcm.file_meta.TransferSyntaxUID
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      frames = wsi_dicom_handler._get_compressed_dicom_frame_bytes(dcm)
+      decoded_frames = []
+      for frame in frames:
+        result = dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
+            frame, dcm.file_meta.TransferSyntaxUID
+        )
+        decoded_frames.append(result)
+      pixel_data = np.asarray(decoded_frames)[..., 0:1].tobytes()
+      if len(pixel_data) % 2 != 0:
+        pixel_data = b'{pixeldata}\x00'
+      dcm.PixelData = pixel_data
+      dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
+      dcm.save_as(dcm_path)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    with self.assertRaisesRegex(
+        data_accessor_errors.DicomError,
+        '.*unsupported PhotometricInterpretation.*',
+    ):
+      list(
+          dicom_handler.process_files(
+              [], {}, abstract_handler.InputFileIterator([dcm_path])
           )
-          decoded_frames.append(result)
-        pixel_data = np.asarray(decoded_frames)[..., 0:1].tobytes()
-        if len(pixel_data) % 2 != 0:
-          pixel_data = b'{pixeldata}\x00'
-        dcm.PixelData = pixel_data
-        dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
-        dcm.save_as(dcm_path)
-      dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-      with self.assertRaisesRegex(
-          data_accessor_errors.DicomError,
-          '.*unsupported PhotometricInterpretation.*',
-      ):
-        list(dicom_handler.process_file([], {}, dcm_path))
+      )
 
   def test_wsi_dicom_handler_dicom_missing_pixel_data_raises(self):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
 
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        del dcm['PixelData']
-        dcm.save_as(dcm_path)
-      dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-      with self.assertRaisesRegex(
-          data_accessor_errors.DicomError, '.*DICOM missing PixelData.*'
-      ):
-        list(dicom_handler.process_file([], {}, dcm_path))
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      del dcm['PixelData']
+      dcm.save_as(dcm_path)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    with self.assertRaisesRegex(
+        data_accessor_errors.DicomError, '.*DICOM missing PixelData.*'
+    ):
+      list(
+          dicom_handler.process_files(
+              [], {}, abstract_handler.InputFileIterator([dcm_path])
+          )
+      )
 
   def test_wsi_dicom_handler_not_vl_whole_slide_micropscopy_image_skips(self):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
 
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        dcm.SOPClassUID = dicom_source_utils._VL_MICROSCOPIC_IMAGE_SOP_CLASS_UID
-        del dcm['PixelData']
-        dcm.save_as(dcm_path)
-      dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-      self.assertEmpty(list(dicom_handler.process_file([], {}, dcm_path)))
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      dcm.SOPClassUID = dicom_source_utils._VL_MICROSCOPIC_IMAGE_SOP_CLASS_UID
+      del dcm['PixelData']
+      dcm.save_as(dcm_path)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    self.assertEmpty(
+        list(
+            dicom_handler.process_files(
+                [], {}, abstract_handler.InputFileIterator([dcm_path])
+            )
+        )
+    )
 
   def test_uncompressed_wsi_missing_pixel_data_raises(
       self,
   ):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      dcm_path = os.path.join(temp_dir, 'test.dcm')
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
 
-      with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
-        del dcm['PixelData']
-        dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
-        dcm.PhotometricInterpretation = 'RGB'
-        dcm.SamplesPerPixel = 3
-        dcm.save_as(dcm_path)
-      dicom_handler = wsi_dicom_handler.WsiDicomHandler()
-      with self.assertRaisesRegex(
-          data_accessor_errors.DicomError,
-          '.*Cannot decode pixel data.*',
-      ):
-        list(dicom_handler.process_file([], {}, dcm_path))
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      del dcm['PixelData']
+      dcm.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
+      dcm.PhotometricInterpretation = 'RGB'
+      dcm.SamplesPerPixel = 3
+      dcm.save_as(dcm_path)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    with self.assertRaisesRegex(
+        data_accessor_errors.DicomError,
+        '.*Cannot decode pixel data.*',
+    ):
+      list(
+          dicom_handler.process_files(
+              [], {}, abstract_handler.InputFileIterator([dcm_path])
+          )
+      )
 
+  def test_concatenated_dicom_raises(self):
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
+
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      dcm.ConcatenationUID = '1.2.3'
+      dcm.save_as(dcm_path)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    with self.assertRaisesRegex(
+        data_accessor_errors.DicomError,
+        '.*Reading concatenated WSI DICOM from sources other than a DICOM store'
+        ' is not supported.*',
+    ):
+      list(
+          dicom_handler.process_files(
+              [], {}, abstract_handler.InputFileIterator([dcm_path])
+          )
+      )
+
+  def test_tiled_sparse_dicom_raises(self):
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
+
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      dcm.DimensionOrganizationType = 'TILED_SPARSE'
+      dcm.save_as(dcm_path)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    with self.assertRaisesRegex(
+        data_accessor_errors.DicomTiledFullError,
+        '.*DICOM DimensionOrganizationType is not TILED_FULL.*',
+    ):
+      list(
+          dicom_handler.process_files(
+              [], {}, abstract_handler.InputFileIterator([dcm_path])
+          )
+      )
+
+  def test_tiled_sparse_dicom_implicit_number_of_frames_one(self):
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      del dcm['NumberOfFrames']
+      dcm.DimensionOrganizationType = 'TILED_SPARSE'
+      dcm.save_as(dcm_path)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    self.assertLen(
+        list(
+            dicom_handler.process_files(
+                [], {}, abstract_handler.InputFileIterator([dcm_path])
+            )
+        ),
+        1,
+    )
+
+  def test_tiled_sparse_dicom_explicit_number_of_frames_one(self):
+    dcm_path = os.path.join(self.create_tempdir(), 'test.dcm')
+    with pydicom.dcmread(_wsi_dicom_file_path()) as dcm:
+      dcm.NumberOfFrames = 1
+      dcm.DimensionOrganizationType = 'TILED_SPARSE'
+      dcm.save_as(dcm_path)
+    dicom_handler = wsi_dicom_handler.WsiDicomHandler()
+    self.assertLen(
+        list(
+            dicom_handler.process_files(
+                [], {}, abstract_handler.InputFileIterator([dcm_path])
+            )
+        ),
+        1,
+    )
 
 if __name__ == '__main__':
   absltest.main()

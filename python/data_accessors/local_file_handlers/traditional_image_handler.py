@@ -13,8 +13,7 @@
 # limitations under the License.
 """local handler for handling traditional image files."""
 
-import io
-from typing import Any, Iterator, Mapping, Sequence, Union
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 import PIL
@@ -58,7 +57,7 @@ def _generate_images(
     for pc in instance_patch_coordinates:
       if patch_required_to_be_fully_in_source_image:
         pc.validate_patch_in_dim(image_shape)
-      yield patch_coordinate_module.get_patch_from_memory(
+      yield  patch_coordinate_module.get_patch_from_memory(
           pc, img
       )
 
@@ -66,13 +65,13 @@ def _generate_images(
 class TraditionalImageHandler(abstract_handler.AbstractHandler):
   """Reads a traditional image from local file system."""
 
-  def process_file(
+  def process_files(
       self,
       instance_patch_coordinates: Sequence[
           patch_coordinate_module.PatchCoordinate
       ],
       base_request: Mapping[str, Any],
-      file_path: Union[str, io.BytesIO],
+      file_paths: abstract_handler.InputFileIterator,
   ) -> Iterator[np.ndarray]:
     instance_extensions = abstract_handler.get_base_request_extensions(
         base_request
@@ -80,31 +79,35 @@ class TraditionalImageHandler(abstract_handler.AbstractHandler):
     target_icc_profile = icc_profile_utils.get_target_icc_profile(
         instance_extensions
     )
-    try:
-      with PIL.Image.open(file_path) as image:
-        img = np.asarray(image)
-        if (
-            target_icc_profile is not None
-            and img.ndim == 3
-            and img.shape[2] == 3
-        ):
-          icc_profile_bytes = (
-              icc_profile_utils.get_icc_profile_bytes_from_pil_image(image)
-          )
-          if icc_profile_bytes:
-            transform = icc_profile_utils.create_icc_profile_transformation(
-                icc_profile_bytes, target_icc_profile
+    for file_path in file_paths:
+      try:
+        with PIL.Image.open(file_path) as image:
+          img = np.asarray(image)
+          if (
+              target_icc_profile is not None
+              and img.ndim == 3
+              and img.shape[2] == 3
+          ):
+            icc_profile_bytes = (
+                icc_profile_utils.get_icc_profile_bytes_from_pil_image(image)
             )
-            if transform is not None:
-              img = (
-                  icc_profile_utils.transform_image_bytes_to_target_icc_profile(
-                      img, transform
-                  )
+            if icc_profile_bytes:
+              transform = icc_profile_utils.create_icc_profile_transformation(
+                  icc_profile_bytes, target_icc_profile
               )
-    except PIL.UnidentifiedImageError:
-      # The handler is purposefully eating the message here.
-      # if a handler fails to process the image it returns an empty iterator.
-      return iter([])
-    return _generate_images(
-        img, instance_patch_coordinates, instance_extensions
-    )
+              if transform is not None:
+                img = (
+                    icc_profile_utils.transform_image_bytes_to_target_icc_profile(
+                        img, transform
+                    )
+                )
+      except (PIL.UnidentifiedImageError, PIL.Image.DecompressionBombError):
+        # The handler is purposefully eating the message here.
+        # if a handler fails to process the image it returns an empty iterator.
+        return
+      yield from _generate_images(
+          img, instance_patch_coordinates, instance_extensions
+      )
+      # mark file as being processed so custom iterator will now return next
+      # file in sequence.
+      file_paths.processed_file()

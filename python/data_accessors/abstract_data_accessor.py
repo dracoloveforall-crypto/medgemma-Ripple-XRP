@@ -31,6 +31,7 @@ class AbstractDataAccessor(
       instance: InstanceDataClass,
   ):
     self._instance = instance
+    self._data_accessor_length = -1
 
   @property
   def instance(self) -> InstanceDataClass:
@@ -54,9 +55,13 @@ class AbstractDataAccessor(
   def is_accessor_data_embedded_in_request(self) -> bool:
     """Returns true if data is embedded inline within the request."""
 
-  @abc.abstractmethod
   def __len__(self) -> int:
     """Returns number of data sets returned by iterator."""
+    if self._data_accessor_length == -1:
+      self._data_accessor_length = 0
+      for _ in self.data_iterator():
+        self._data_accessor_length += 1
+    return self._data_accessor_length
 
   @abc.abstractmethod
   def data_iterator(self) -> Iterator[InstanceDataType]:

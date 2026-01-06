@@ -751,6 +751,11 @@ class ImageEncoderTest(parameterized.TestCase):
     expected[2, 2, :] = 3
     self.assertEqual(decoded_image.tolist(), expected.tolist())
 
+  def test_get_local_file_handler_initalizes_once(self):
+    self.assertIs(
+        predictor._get_local_file_handlers(),
+        predictor._get_local_file_handlers(),
+    )
 
 if __name__ == '__main__':
   absltest.main()

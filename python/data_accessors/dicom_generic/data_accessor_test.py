@@ -14,6 +14,7 @@
 
 """Unit tests for dicom_generic data accessor."""
 
+import contextlib
 from typing import Any, Mapping, Sequence
 
 from absl.testing import absltest
@@ -23,6 +24,7 @@ from ez_wsi_dicomweb import dicom_web_interface
 from ez_wsi_dicomweb.ml_toolkit import dicom_path
 import numpy as np
 import pydicom
+import requests_mock
 
 from data_accessors import data_accessor_const
 from data_accessors import data_accessor_errors
@@ -86,7 +88,7 @@ class DataAccessorTest(parameterized.TestCase):
             require_patch_dim_match_default_dim=False,
             dicom_instances_metadata=[],
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaises(data_accessor_errors.InvalidRequestFieldError):
           list(data_accessor.DicomGenericData(instance).data_iterator())
 
   @parameterized.named_parameters(
@@ -192,19 +194,100 @@ class DataAccessorTest(parameterized.TestCase):
     with pydicom.dcmread(
         test_utils.testdata_path('cxr', 'encapsulated_cxr.dcm')
     ) as dcm:
-      json_instance = {
-          _InstanceJsonKeys.DICOM_WEB_URI: _create_dicom_web_uri(dcm),
-      }
-      json_instance.update(metadata)
-      instance = data_accessor_definition.json_to_generic_dicom_image(
-          credential_factory_module.NoAuthCredentialsFactory(),
-          json_instance,
-          default_patch_width=256,
-          default_patch_height=256,
-          require_patch_dim_match_default_dim=False,
-          dicom_instances_metadata=[],
-      )
-      self.assertLen(data_accessor.DicomGenericData(instance), expected)
+      with dicom_store_mock.MockDicomStores(
+          _MOCK_DICOM_STORE_PATH
+      ) as dicom_store:
+        dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
+        instance_path = _create_dicom_web_uri(dcm)
+        json_instance = {
+            _InstanceJsonKeys.DICOM_WEB_URI: instance_path,
+        }
+        json_instance.update(metadata)
+        dwi = dicom_web_interface.DicomWebInterface(
+            credential_factory_module.NoAuthCredentialsFactory()
+        )
+        instance = data_accessor_definition.json_to_generic_dicom_image(
+            credential_factory_module.NoAuthCredentialsFactory(),
+            json_instance,
+            default_patch_width=256,
+            default_patch_height=256,
+            require_patch_dim_match_default_dim=False,
+            dicom_instances_metadata=dwi.get_instances(
+                dicom_path.FromString(instance_path)
+            ),
+        )
+        self.assertLen(data_accessor.DicomGenericData(instance), expected)
+
+  @parameterized.parameters([0, 1, 2])
+  def test_paralell_dicom_download(self, max_parallel_download_workers):
+    with pydicom.dcmread(
+        test_utils.testdata_path('cxr', 'encapsulated_cxr.dcm')
+    ) as dcm:
+      with dicom_store_mock.MockDicomStores(
+          _MOCK_DICOM_STORE_PATH
+      ) as dicom_store:
+        dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
+        instance_path = _create_dicom_web_uri(dcm)
+        json_instance = {
+            _InstanceJsonKeys.DICOM_SOURCE: [instance_path, instance_path],
+        }
+        dwi = dicom_web_interface.DicomWebInterface(
+            credential_factory_module.NoAuthCredentialsFactory()
+        )
+        instance = data_accessor_definition.json_to_generic_dicom_image(
+            credential_factory_module.NoAuthCredentialsFactory(),
+            json_instance,
+            default_patch_width=256,
+            default_patch_height=256,
+            require_patch_dim_match_default_dim=False,
+            dicom_instances_metadata=dwi.get_instances(
+                dicom_path.FromString(instance_path)
+            ),
+        )
+        data_accessor_instance = data_accessor.DicomGenericData(
+            instance,
+            max_parallel_download_workers=max_parallel_download_workers,
+        )
+        with contextlib.ExitStack() as stack:
+          data_accessor_instance.load_data(stack)
+          data_accessor_instance.load_data(stack)
+          self.assertLen(data_accessor_instance, 2)
+
+  @parameterized.parameters(
+      ['1.2.840.10008.1.2', '1.2.840.10008.1.2.1', '1.2.840.10008.1.2.1.99']
+  )
+  def test_can_decode_unencapsulated_transfer_syntax(self, uid):
+    self.assertTrue(data_accessor._can_decode_transfer_syntax(uid))
+
+  def test_raises_error_if_bad_dicom(self):
+    with pydicom.dcmread(
+        test_utils.testdata_path('cxr', 'encapsulated_cxr.dcm')
+    ) as dcm:
+      instance_path = _create_dicom_web_uri(dcm)
+
+      with dicom_store_mock.MockDicomStores(
+          _MOCK_DICOM_STORE_PATH
+      ) as dicom_store:
+        dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
+        dwi = dicom_web_interface.DicomWebInterface(
+            credential_factory_module.NoAuthCredentialsFactory()
+        )
+        metadata = dwi.get_instances(dicom_path.FromString(instance_path))
+      with requests_mock.Mocker() as m:
+        m.get(instance_path, content=b'1234')
+        json_instance = {
+            _InstanceJsonKeys.DICOM_SOURCE: [instance_path],
+        }
+        instance = data_accessor_definition.json_to_generic_dicom_image(
+            credential_factory_module.NoAuthCredentialsFactory(),
+            json_instance,
+            default_patch_width=256,
+            default_patch_height=256,
+            require_patch_dim_match_default_dim=False,
+            dicom_instances_metadata=metadata,
+        )
+        with self.assertRaises(data_accessor_errors.DicomError):
+          list(data_accessor.DicomGenericData(instance).data_iterator())
 
 
 if __name__ == '__main__':

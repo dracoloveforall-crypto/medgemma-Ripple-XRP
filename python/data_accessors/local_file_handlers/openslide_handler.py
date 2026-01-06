@@ -13,8 +13,11 @@
 # limitations under the License.
 """local handler for handling openslide image files."""
 
+import contextlib
 import dataclasses
 import io
+import os
+import tempfile
 from typing import Any, Iterator, Mapping, Optional, Sequence, Union
 
 import numpy as np
@@ -33,6 +36,14 @@ _InstanceJsonKeys = data_accessor_const.InstanceJsonKeys
 
 
 @dataclasses.dataclass(frozen=True)
+class EndpointInputDimensions:
+  """Holds endpoint input dimensions."""
+
+  width_px: int
+  height_px: int
+
+
+@dataclasses.dataclass(frozen=True)
 class PixelSpacing:
   """Holds pixel spacing information."""
 
@@ -48,6 +59,14 @@ def _get_patch_from_memory(
     level_height: int,
 ) -> np.ndarray:
   """Returns a patch from memory."""
+  if (
+      projected_patch.projected_read_height
+      * projected_patch.projected_read_width
+      > 10000 * 10000
+  ):
+    raise data_accessor_errors.InvalidRequestFieldError(
+        'OpenSlide patch dimensions exceed 100,000,000 pixels.'
+    )
   level_0_width, level_0_height = slide.dimensions
   if (
       projected_patch.start_x >= 0
@@ -134,12 +153,6 @@ def _get_patch(
 ) -> np.ndarray:
   """Returns a patch from a openslide image."""
   level_width, level_height = slide.level_dimensions[slide_level]
-  if (
-      resize_image_dimensions is not None
-      and resize_image_dimensions.width == level_width
-      and resize_image_dimensions.height == level_height
-  ):
-    resize_image_dimensions = None
   if validate_patch_in_dim:
     if resize_image_dimensions is None:
       pc.validate_patch_in_dim(
@@ -147,11 +160,9 @@ def _get_patch(
       )
     else:
       pc.validate_patch_in_dim(resize_image_dimensions)
-
   projected_patch = image_dimension_utils.get_projected_patch(
       pc, level_width, level_height, resize_image_dimensions
   )
-
   memory = _get_patch_from_memory(
       slide,
       slide_level,
@@ -193,8 +204,6 @@ def _decode_open_slide_image(
     else:
       width = resize_image_dimensions.width
       height = resize_image_dimensions.height
-      if (width, height) == slide.level_dimensions[slide_level]:
-        resize_image_dimensions = None
     patch_coordinates = [
         patch_coordinate_module.PatchCoordinate(0, 0, width, height)
     ]
@@ -205,6 +214,13 @@ def _decode_open_slide_image(
   icc_profile_image_transformation = _create_icc_profile_image_transformation(
       slide_color_profile, target_icc_profile
   )
+  level_width, level_height = slide.level_dimensions[slide_level]
+  if (
+      resize_image_dimensions is not None
+      and resize_image_dimensions.width == level_width
+      and resize_image_dimensions.height == level_height
+  ):
+    resize_image_dimensions = None
   for pc in patch_coordinates:
     decoded_image_bytes = _get_patch(
         slide,
@@ -262,20 +278,42 @@ def _get_open_slide_level_from_pixel_spacing(
   return slide.level_count - 1
 
 
+def _get_default_openslide_level(
+    slide: openslide.OpenSlide,
+    patch_coordinates: Sequence[patch_coordinate_module.PatchCoordinate],
+    endpoint_input_dim: EndpointInputDimensions,
+) -> int:
+  """Returns the default openslide level if none is provided."""
+  if not patch_coordinates:
+    for index in range(slide.level_count - 1, 0, -1):
+      width, height = slide.level_dimensions[index]
+      if (
+          width >= endpoint_input_dim.width_px
+          and height >= endpoint_input_dim.height_px
+      ):
+        return index
+  return 0
+
+
 def _parse_openslide_level(
     base_request: Mapping[str, Any],
 ) -> Optional[Union[int, image_dimension_utils.ImageDimensions, PixelSpacing]]:
   """Parse openslide level from base request."""
-  level_dict = json_validation_utils.validate_str_key_dict(
-      base_request.get(_InstanceJsonKeys.OPENSLIDE_PYRAMID_LEVEL, {})
-  )
+  try:
+    level_dict = json_validation_utils.validate_str_key_dict(
+        base_request.get(_InstanceJsonKeys.OPENSLIDE_PYRAMID_LEVEL, {})
+    )
+  except json_validation_utils.ValidationError as exp:
+    raise data_accessor_errors.InvalidRequestFieldError(
+        'Invalid JSON formatted openslide pyramid level.'
+    ) from exp
   level = level_dict.get(_InstanceJsonKeys.OPENSLIDE_LEVEL_INDEX)
   if level is not None:
     try:
       return int(level)
     except ValueError:
       raise data_accessor_errors.InvalidRequestFieldError(
-          'Failed to parse openslide level.'
+          'Failed to parse OpenSlide level index; value must be an integer.'
       ) from ValueError
   width = level_dict.get(_InstanceJsonKeys.OPENSLIDE_LEVEL_WIDTH_PX)
   height = level_dict.get(_InstanceJsonKeys.OPENSLIDE_LEVEL_HEIGHT_PX)
@@ -284,7 +322,7 @@ def _parse_openslide_level(
       return image_dimension_utils.ImageDimensions(int(width), int(height))
     except ValueError:
       raise data_accessor_errors.InvalidRequestFieldError(
-          'Failed to parse openslide level.'
+          'Failed to parse OpenSlide level width and/or height.'
       ) from ValueError
   default_ps = level_dict.get(
       _InstanceJsonKeys.OPENSLIDE_LEVEL_PIXEL_SPACING_MMP
@@ -300,7 +338,7 @@ def _parse_openslide_level(
       return PixelSpacing(float(width_mmp), float(height_mmp))
     except ValueError:
       raise data_accessor_errors.InvalidRequestFieldError(
-          'Failed to parse openslide level.'
+          'Failed to parse OpenSlide level width and/or height pixel spacing.'
       ) from ValueError
   return None
 
@@ -308,59 +346,78 @@ def _parse_openslide_level(
 class OpenSlideHandler(abstract_handler.AbstractHandler):
   """Reads a traditional image from local file system."""
 
-  def process_file(
+  def __init__(self, endpoint_input_dim: EndpointInputDimensions):
+    self._endpoint_input_dim = endpoint_input_dim
+
+  def process_files(
       self,
       instance_patch_coordinates: Sequence[
           patch_coordinate_module.PatchCoordinate
       ],
       base_request: Mapping[str, Any],
-      file_path: Union[str, io.BytesIO],
+      file_paths: abstract_handler.InputFileIterator,
   ) -> Iterator[np.ndarray]:
     instance_extensions = abstract_handler.get_base_request_extensions(
         base_request
     )
-    openslide_level = _parse_openslide_level(base_request)
-    if openslide_level is None:
-      return
-    try:
-      if isinstance(file_path, io.BytesIO):
-        file_path.seek(0)  # pytype: disable=attribute-error
-        file_path = file_path.read()  # pytype: disable=attribute-error
-      resize_image_dimensions = (
-          image_dimension_utils.get_resize_image_dimensions(instance_extensions)
-      )
-      with openslide.OpenSlide(file_path) as slide:
-        if isinstance(openslide_level, int):
-          slide_level = _get_open_slide_level_from_int(openslide_level, slide)
-        elif isinstance(openslide_level, image_dimension_utils.ImageDimensions):
-          slide_level = _get_open_slide_level_from_dimensions(
-              openslide_level, slide
-          )
-        elif isinstance(openslide_level, PixelSpacing):
-          slide_level = _get_open_slide_level_from_pixel_spacing(
-              openslide_level, slide
-          )
-        else:
-          raise data_accessor_errors.InvalidRequestFieldError(
-              'unrecognized openslide_level'
-          )
-        target_icc_profile = icc_profile_utils.get_target_icc_profile(
-            instance_extensions
-        )
-        patch_required_to_be_fully_in_source_image = (
-            patch_coordinate_module.patch_required_to_be_fully_in_source_image(
+    resize_image_dimensions = image_dimension_utils.get_resize_image_dimensions(
+        instance_extensions
+    )
+    for file_path in file_paths:
+      try:
+        with contextlib.ExitStack() as stack:
+          if isinstance(file_path, io.BytesIO):
+            image_bytes = file_path.read()
+            tdir = stack.enter_context(tempfile.TemporaryDirectory())
+            file_path = os.path.join(tdir, 'temp')
+            with open(file_path, 'wb') as f:
+              f.write(image_bytes)
+          with openslide.OpenSlide(file_path) as slide:
+            if slide.level_count < 1:
+              raise data_accessor_errors.DataAccessorError(
+                  'Openslide image has no pyramid levels. Please provide a'
+                  ' valid slide.'
+              )
+            openslide_level = _parse_openslide_level(base_request)
+            if isinstance(openslide_level, int):
+              slide_level = _get_open_slide_level_from_int(
+                  openslide_level, slide
+              )
+            elif isinstance(
+                openslide_level, image_dimension_utils.ImageDimensions
+            ):
+              slide_level = _get_open_slide_level_from_dimensions(
+                  openslide_level, slide
+              )
+            elif isinstance(openslide_level, PixelSpacing):
+              slide_level = _get_open_slide_level_from_pixel_spacing(
+                  openslide_level, slide
+              )
+            else:
+              slide_level = _get_default_openslide_level(
+                  slide,
+                  instance_patch_coordinates,
+                  self._endpoint_input_dim,
+              )
+            target_icc_profile = icc_profile_utils.get_target_icc_profile(
                 instance_extensions
             )
-        )
-        yield from _decode_open_slide_image(
-            slide,
-            slide_level,
-            target_icc_profile,
-            instance_patch_coordinates,
-            resize_image_dimensions,
-            patch_required_to_be_fully_in_source_image,
-        )
-    except openslide.OpenSlideError:
-      # The handler is purposefully eating the message here.
-      # if a handler fails to process the image it returns an empty iterator.
-      return
+            patch_required_to_be_fully_in_source_image = patch_coordinate_module.patch_required_to_be_fully_in_source_image(
+                instance_extensions
+            )
+            yield from _decode_open_slide_image(
+                slide,
+                slide_level,
+                target_icc_profile,
+                instance_patch_coordinates,
+                resize_image_dimensions,
+                patch_required_to_be_fully_in_source_image,
+            )
+            # mark file as being processed so custom iterator will now return
+            # next file in sequence.
+            file_paths.processed_file()
+      except openslide.OpenSlideError:
+        # The handler is purposefully eating the message here.
+        # if a handler fails to process the image it returns an empty iterator.
+
+        return

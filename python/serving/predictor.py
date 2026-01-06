@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Callable responsible for running Inference on provided patches."""
+
 from __future__ import annotations
 
 import base64
@@ -45,6 +46,7 @@ from data_accessors.inline_bytes import data_accessor as inline_bytes_data_acces
 from data_accessors.inline_bytes import data_accessor_definition as inline_bytes_data_accessor_definition
 from data_accessors.inline_text import data_accessor as inline_text_data_accessor
 from data_accessors.inline_text import data_accessor_definition as inline_text_data_accessor_definition
+from data_accessors.local_file_handlers import abstract_handler
 from data_accessors.local_file_handlers import generic_dicom_handler
 from data_accessors.local_file_handlers import openslide_handler
 from data_accessors.local_file_handlers import traditional_image_handler
@@ -80,13 +82,28 @@ _EmbeddingInstance = Union[
     http_image_data_accessor_definition.HttpImage,
 ]
 
+_local_file_handlers: Optional[Sequence[abstract_handler.AbstractHandler]] = (
+    None
+)
 
-_LOCAL_FILE_HANDLERS = [
-    generic_dicom_handler.GenericDicomHandler(),
-    traditional_image_handler.TraditionalImageHandler(),
-    openslide_handler.OpenSlideHandler(),
-    wsi_dicom_handler.WsiDicomHandler(),
-]
+
+def _get_local_file_handlers() -> Sequence[abstract_handler.AbstractHandler]:
+  """Returns local file handlers."""
+  global _local_file_handlers
+  if _local_file_handlers is None:
+    _local_file_handlers = [
+        generic_dicom_handler.GenericDicomHandler(),
+        traditional_image_handler.TraditionalImageHandler(),
+        openslide_handler.OpenSlideHandler(
+            openslide_handler.EndpointInputDimensions(
+                width_px=flags.MODEL_INPUT_WIDTH_FLAG.value,
+                height_px=flags.MODEL_INPUT_HEIGHT_FLAG.value,
+            )
+        ),
+        wsi_dicom_handler.WsiDicomHandler(),
+    ]
+  return _local_file_handlers
+
 
 # endpoint configurations.
 _GCS_DOWNLOAD_THREAD_COUNT = int(2)
@@ -133,7 +150,7 @@ def _parse_image_content(
         )
     )
     return inline_bytes_data_accessor.InlineBytesData(
-        parsed_instance, _LOCAL_FILE_HANDLERS
+        parsed_instance, _get_local_file_handlers()
     )
   # support HTTP data source.
   if instance[predictor_const.INPUT_TYPE] == predictor_const.IMAGE_TYPE_URL:
@@ -148,7 +165,9 @@ def _parse_image_content(
         False,  # Require patch dim match default dim.
     )
     return http_image_data_accessor.HttpImageData(
-        parsed_instance, _LOCAL_FILE_HANDLERS
+        parsed_instance,
+        _get_local_file_handlers(),
+        max_parallel_download_workers=config.max_parallel_download_workers,
     )
   # support GCS and DICOM.
   if instance[predictor_const.INPUT_TYPE] == predictor_const.IMAGE_TYPE_GCS:
@@ -166,8 +185,9 @@ def _parse_image_content(
     )
     return gcs_generic_data_accessor.GcsGenericData(
         parsed_instance,
-        _LOCAL_FILE_HANDLERS,
+        _get_local_file_handlers(),
         _GCS_DOWNLOAD_THREAD_COUNT,
+        max_parallel_download_workers=config.max_parallel_download_workers,
     )
   if instance[predictor_const.INPUT_TYPE] == predictor_const.IMAGE_TYPE_DICOM:
     # decode dicom path
@@ -205,7 +225,10 @@ def _parse_image_content(
             result.dicom_instances_metadata,
         )
     )
-    return dicom_generic_data_accessor.DicomGenericData(parsed_instance)
+    return dicom_generic_data_accessor.DicomGenericData(
+        parsed_instance,
+        max_parallel_download_workers=config.max_parallel_download_workers,
+    )
   raise data_accessor_errors.InvalidRequestFieldError(
       'Unsupported image instance input type.'
   )
@@ -682,7 +705,7 @@ class MedGemmaPredictor:
       self,
       *,
       prompt_converter: Callable[[list[dict[str, Any]], dict[str, Any]], str],
-      instance_validator: jsonschema.Draft202012Validator | None = None
+      instance_validator: jsonschema.Draft202012Validator | None = None,
   ):
     self._prompt_converter = prompt_converter
     self._instance_validator = instance_validator
@@ -714,6 +737,9 @@ class MedGemmaPredictor:
             redis_port=flags.ICC_PROFILE_CACHE_REDIS_PORT_FLAG.value,
             store_icc_profile_bytes_in_redis=flags.STORE_ICC_PROFILE_BYTES_IN_REDIS_FLAG.value,
             testing=flags.IS_DEBUGGING_FLAG.value,
+        ),
+        max_parallel_download_workers=max(
+            1, flags.MAX_PARALLEL_DOWNLOAD_WORKERS_FLAG.value
         ),
     )
     try:
@@ -754,8 +780,8 @@ class MedGemmaPredictor:
                 prediction_input[INSTANCES_KEY][0]
             )
         except jsonschema.exceptions.ValidationError as e:
-          cloud_logging_client.warning("Input validation failed")
-          return {"error": str(e)}
+          cloud_logging_client.warning('Input validation failed')
+          return {'error': str(e)}
         return {
             PREDICTIONS_KEY: self._single_predict(
                 prediction_input[INSTANCES_KEY][0], model
@@ -766,8 +792,8 @@ class MedGemmaPredictor:
           for instance in prediction_input[INSTANCES_KEY]:
             self._instance_validator.validate(instance)
       except jsonschema.exceptions.ValidationError as e:
-        cloud_logging_client.warning("Input validation failed")
-        return {"error": str(e)}
+        cloud_logging_client.warning('Input validation failed')
+        return {'error': str(e)}
       predictions = [
           self._single_predict(instance, model)
           for instance in prediction_input[INSTANCES_KEY]
@@ -778,6 +804,6 @@ class MedGemmaPredictor:
       if self._instance_validator is not None:
         self._instance_validator.validate(prediction_input)
     except jsonschema.exceptions.ValidationError as e:
-      cloud_logging_client.warning("Input validation failed")
-      return {"error": str(e)}
+      cloud_logging_client.warning('Input validation failed')
+      return {'error': str(e)}
     return self._single_predict(prediction_input, model)

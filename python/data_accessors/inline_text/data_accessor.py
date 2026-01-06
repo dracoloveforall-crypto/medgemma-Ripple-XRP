@@ -37,7 +37,3 @@ class InlineText(
     """Method pre-loads data prior to data_iterator."""
     return
 
-  def __len__(self) -> int:
-    """Returns number of data sets returned by iterator."""
-    return 1
-

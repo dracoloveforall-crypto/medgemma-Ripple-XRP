@@ -15,7 +15,6 @@
 
 import io
 import os
-import tempfile
 from typing import Any, Mapping
 
 from absl.testing import absltest
@@ -27,6 +26,7 @@ import PIL.Image
 
 from data_accessors import data_accessor_const
 from data_accessors import data_accessor_errors
+from data_accessors.local_file_handlers import abstract_handler
 from data_accessors.local_file_handlers import traditional_image_handler
 from data_accessors.utils import patch_coordinate
 from data_accessors.utils import test_utils
@@ -52,8 +52,12 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
 
   def test_load_image(self):
     images = list(
-        _traditonal_image_handler.process_file(
-            [], {}, test_utils.testdata_path("image.jpeg")
+        _traditonal_image_handler.process_files(
+            [],
+            {},
+            abstract_handler.InputFileIterator(
+                [test_utils.testdata_path("image.jpeg")]
+            ),
         )
     )
     self.assertLen(images, 1)
@@ -64,8 +68,12 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
 
   def test_load_bw_image(self):
     images = list(
-        _traditonal_image_handler.process_file(
-            [], {}, test_utils.testdata_path("image_bw.jpeg")
+        _traditonal_image_handler.process_files(
+            [],
+            {},
+            abstract_handler.InputFileIterator(
+                [test_utils.testdata_path("image_bw.jpeg")]
+            ),
         )
     )
     self.assertLen(images, 1)
@@ -80,7 +88,9 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
     with open(test_utils.testdata_path("image.jpeg"), "rb") as f:
       with io.BytesIO(f.read()) as binary_file:
         images = list(
-            _traditonal_image_handler.process_file([], {}, binary_file)
+            _traditonal_image_handler.process_files(
+                [], {}, abstract_handler.InputFileIterator([binary_file])
+            )
         )
         self.assertLen(images, 1)
         self.assertEqual(images[0].shape, (67, 100, 3))
@@ -92,13 +102,15 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
 
   def test_load_image_patches_coordinates(self):
     images = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             [
                 patch_coordinate.PatchCoordinate(0, 0, 10, 10),
                 patch_coordinate.PatchCoordinate(10, 10, 10, 10),
             ],
             {},
-            test_utils.testdata_path("image.jpeg"),
+            abstract_handler.InputFileIterator(
+                [test_utils.testdata_path("image.jpeg")]
+            ),
         )
     )
     self.assertLen(images, 2)
@@ -111,13 +123,15 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
 
   def test_load_image_bw_patches_coordinates(self):
     images = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             [
                 patch_coordinate.PatchCoordinate(0, 0, 10, 10),
                 patch_coordinate.PatchCoordinate(10, 10, 10, 10),
             ],
             {},
-            test_utils.testdata_path("image_bw.jpeg"),
+            abstract_handler.InputFileIterator(
+                [test_utils.testdata_path("image_bw.jpeg")]
+            ),
         )
     )
     self.assertLen(images, 2)
@@ -135,25 +149,29 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
         data_accessor_errors.PatchOutsideOfImageDimensionsError
     ):
       list(
-          _traditonal_image_handler.process_file(
+          _traditonal_image_handler.process_files(
               [
                   patch_coordinate.PatchCoordinate(-1, 0, 10, 10),
               ],
               {},
-              test_utils.testdata_path("image.jpeg"),
+              abstract_handler.InputFileIterator(
+                  [test_utils.testdata_path("image.jpeg")]
+              ),
           )
       )
 
   def test_disable_patches_coordinates_outside_of_dim_raises(self):
     images = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             [
                 patch_coordinate.PatchCoordinate(5, 0, 4000, 10),
             ],
             _mock_instance_extension_metadata(
                 {_InstanceJsonKeys.REQUIRE_PATCHES_FULLY_IN_SOURCE_IMAGE: False}
             ),
-            test_utils.testdata_path("image.jpeg"),
+            abstract_handler.InputFileIterator(
+                [test_utils.testdata_path("image.jpeg")]
+            ),
         )
     )
     self.assertLen(images, 1)
@@ -164,7 +182,7 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
         data_accessor_errors.InvalidIccProfileTransformError
     ):
       list(
-          _traditonal_image_handler.process_file(
+          _traditonal_image_handler.process_files(
               [
                   patch_coordinate.PatchCoordinate(0, 0, 10, 10),
               ],
@@ -173,7 +191,9 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
                       "bad_value"
                   )
               }),
-              test_utils.testdata_path("image.jpeg"),
+              abstract_handler.InputFileIterator(
+                  [test_utils.testdata_path("image.jpeg")]
+              ),
           )
       )
 
@@ -181,10 +201,12 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
       self,
   ):
     images = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             [],
             _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
-            test_utils.testdata_path("image.jpeg"),
+            abstract_handler.InputFileIterator(
+                [test_utils.testdata_path("image.jpeg")]
+            ),
         )
     )
     with PIL.Image.open(test_utils.testdata_path("image.jpeg")) as source_img:
@@ -193,36 +215,34 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
 
   def test_transform_to_icc_profile(self):
     romm_profile = dicom_slide.get_rommrgb_icc_profile_bytes()
-    with tempfile.TemporaryDirectory() as temp_dir:
-      temp_image_path = os.path.join(temp_dir, "test_image.png")
-      with PIL.Image.open(test_utils.testdata_path("image.jpeg")) as source_img:
-        source_img.save(temp_image_path, icc_profile=romm_profile)
-      images = list(
-          _traditonal_image_handler.process_file(
-              [],
-              _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
-              temp_image_path,
-          )
-      )
+    temp_image_path = os.path.join(self.create_tempdir(), "test_image.png")
+    with PIL.Image.open(test_utils.testdata_path("image.jpeg")) as source_img:
+      source_img.save(temp_image_path, icc_profile=romm_profile)
+    images = list(
+        _traditonal_image_handler.process_files(
+            [],
+            _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
+            abstract_handler.InputFileIterator([temp_image_path]),
+        )
+    )
     with PIL.Image.open(test_utils.testdata_path("image.jpeg")) as source_img:
       expected_img = np.asarray(source_img)
       self.assertFalse(np.array_equal(images[0], expected_img))
 
   def test_transform_bw_image_to_icc_profile_no_change(self):
     romm_profile = dicom_slide.get_rommrgb_icc_profile_bytes()
-    with tempfile.TemporaryDirectory() as temp_dir:
-      temp_image_path = os.path.join(temp_dir, "test_image.png")
-      with PIL.Image.open(
-          test_utils.testdata_path("image_bw.jpeg")
-      ) as source_img:
-        source_img.save(temp_image_path, icc_profile=romm_profile)
-      images = list(
-          _traditonal_image_handler.process_file(
-              [],
-              _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
-              temp_image_path,
-          )
-      )
+    temp_image_path = os.path.join(self.create_tempdir(), "test_image.png")
+    with PIL.Image.open(
+        test_utils.testdata_path("image_bw.jpeg")
+    ) as source_img:
+      source_img.save(temp_image_path, icc_profile=romm_profile)
+    images = list(
+        _traditonal_image_handler.process_files(
+            [],
+            _MOCK_INSTANCE_METADATA_REQUEST_ICCPROFILE_NORM,
+            abstract_handler.InputFileIterator([temp_image_path]),
+        )
+    )
     with PIL.Image.open(
         test_utils.testdata_path("image_bw.jpeg")
     ) as source_img:
@@ -247,7 +267,7 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
       pixel_data = np.asarray(source_img)
       width, height = source_img.width, source_img.height
     img = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             [],
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -255,7 +275,7 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: int(height * scale_factor),
                 }
             }),
-            img_path,
+            abstract_handler.InputFileIterator([img_path]),
         )
     )
     self.assertLen(img, 1)
@@ -290,7 +310,7 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
       pixel_data = np.asarray(source_img)
       width, height = source_img.width, source_img.height
     images = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             patch_coordinates,
             _mock_instance_extension_metadata({
                 _InstanceJsonKeys.IMAGE_DIMENSIONS: {
@@ -298,7 +318,7 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
                     _InstanceJsonKeys.HEIGHT: int(height * scale_factor),
                 }
             }),
-            img_path,
+            abstract_handler.InputFileIterator([img_path]),
         )
     )
     expected_img = cv2.resize(
@@ -322,12 +342,12 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
     with PIL.Image.open(img_path) as source_img:
       pixel_data = np.asarray(source_img)
     img = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             [patch_coordinate.PatchCoordinate(-10, -10, 20, 20)],
             _mock_instance_extension_metadata(
                 {_InstanceJsonKeys.REQUIRE_PATCHES_FULLY_IN_SOURCE_IMAGE: False}
             ),
-            img_path,
+            abstract_handler.InputFileIterator([img_path]),
         )
     )
     self.assertLen(img, 1)
@@ -344,12 +364,12 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
       pixel_data = np.asarray(source_img)
 
     img = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             [patch_coordinate.PatchCoordinate(10, 10, 100, 67)],
             _mock_instance_extension_metadata(
                 {_InstanceJsonKeys.REQUIRE_PATCHES_FULLY_IN_SOURCE_IMAGE: False}
             ),
-            img_path,
+            abstract_handler.InputFileIterator([img_path]),
         )
     )
     self.assertLen(img, 1)
@@ -366,12 +386,12 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
       pixel_data = np.asarray(source_img)
 
     img = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             [patch_coordinate.PatchCoordinate(-1, -1, 102, 69)],
             _mock_instance_extension_metadata(
                 {_InstanceJsonKeys.REQUIRE_PATCHES_FULLY_IN_SOURCE_IMAGE: False}
             ),
-            img_path,
+            abstract_handler.InputFileIterator([img_path]),
         )
     )
     self.assertLen(img, 1)
@@ -388,12 +408,12 @@ class TraditionalImageHandlerTest(parameterized.TestCase):
       pixel_data = np.asarray(source_img)
 
     img = list(
-        _traditonal_image_handler.process_file(
+        _traditonal_image_handler.process_files(
             [patch_coordinate.PatchCoordinate(10, 11, 20, 21)],
             _mock_instance_extension_metadata(
                 {_InstanceJsonKeys.REQUIRE_PATCHES_FULLY_IN_SOURCE_IMAGE: True}
             ),
-            img_path,
+            abstract_handler.InputFileIterator([img_path]),
         )
     )
     self.assertLen(img, 1)

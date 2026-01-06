@@ -20,7 +20,3 @@ def testdata_path(*args: str) -> str:
   base_path = ['wsi']
   base_path.extend(args)
   return test_utils.testdata_path(*base_path)
-
-
-def test_multi_frame_dicom_instance_path() -> str:
-  return testdata_path('multiframe_camelyon_challenge_image.dcm')

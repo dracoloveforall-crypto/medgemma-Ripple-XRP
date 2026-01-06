@@ -14,9 +14,10 @@
 # ==============================================================================
 """Determines the SOPClassUIDs of a DICOM data for modality specfic processing."""
 
+import collections
 import dataclasses
 import enum
-from typing import Any, List, Mapping
+from typing import Any, List, Mapping, Sequence
 
 from ez_wsi_dicomweb import credential_factory
 from ez_wsi_dicomweb import dicom_web_interface
@@ -52,6 +53,210 @@ DICOM_MICROSCOPY_IODS = frozenset([
 ])
 
 
+class MODALITY:
+  """Modality Coded Values."""
+
+  CR = 'CR'  # Computed Radiography
+  DX = 'DX'  # Digital X-Ray
+  GM = 'GM'  # General Microscopy
+  SM = 'SM'  # Slide Microscopy
+  XC = 'XC'  # External Camera
+  CT = 'CT'  # Computed Tomography
+  MR = 'MR'  # Magnetic Resonance
+
+
+CT_AND_MRI_MODALITIES = (MODALITY.CT, MODALITY.MR)
+CXR_MODALITIES = (MODALITY.CR, MODALITY.DX)
+MICROSCOPY_MODALITIES = (MODALITY.SM, MODALITY.GM)
+_CT_SOP_CLASS_UIDS = frozenset([
+    '1.2.840.10008.5.1.4.1.1.2',
+    '1.2.840.10008.5.1.4.1.1.2.1',
+    '1.2.840.10008.5.1.4.1.1.2.2',
+])
+
+_MR_SOP_CLASS_UIDS = frozenset([
+    '1.2.840.10008.5.1.4.1.1.4',
+    '1.2.840.10008.5.1.4.1.1.4.1',
+    '1.2.840.10008.5.1.4.1.1.4.4',
+])
+_SM_SOP_CLASS_UIDS = frozenset([
+    _VL_SLIDE_COORDINATES_MICROSCOPIC_IMAGE_SOP_CLASS_UID,
+    _VL_MICROSCOPIC_IMAGE_SOP_CLASS_UID,
+    VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_SOP_CLASS_UID,
+])
+
+_DX_SOP_CLASS_UIDS = frozenset([
+    '1.2.840.10008.5.1.4.1.1.1.1',
+    '1.2.840.10008.5.1.4.1.1.1.1.1',
+    '1.2.840.10008.5.1.4.1.1.1.2',
+    '1.2.840.10008.5.1.4.1.1.1.2.1',
+    '1.2.840.10008.5.1.4.1.1.1.3',
+    '1.2.840.10008.5.1.4.1.1.1.3.1',
+])
+
+
+#  Start: Utility functions to identify a single CT or MRI volume
+#  if given a series
+
+
+def _filter_image_type(
+    dicom_series_metadata: Sequence[dicom_web_interface.DicomObject],
+) -> Sequence[dicom_web_interface.DicomObject]:
+  """Filters a list of DICOM instances by image type."""
+  missing_image_type = []
+  derived_metadata = []
+  non_derived_metadata = []
+  for i_md in dicom_series_metadata:
+    image_type = i_md.get_list_value(tags.IMAGE_TYPE, [])
+    if not image_type:
+      missing_image_type.append(i_md)
+    elif 'DERIVED' in image_type:
+      derived_metadata.append(i_md)
+    else:
+      non_derived_metadata.append(i_md)
+  if non_derived_metadata:
+    return non_derived_metadata
+  if derived_metadata:
+    return derived_metadata
+  return missing_image_type
+
+
+def _filter_acquisition_number(
+    dicom_series_metadata: Sequence[dicom_web_interface.DicomObject],
+) -> Sequence[dicom_web_interface.DicomObject]:
+  """Return metadata for single acquisition from a list of DICOM metadata.
+
+  Behavior:
+    1. returns acquisition with most instances.
+    2. If acquisition number is are not defined returns list of all instances.
+
+  Args:
+    dicom_series_metadata: A list of DICOM instances metadata.
+
+  Returns:
+    A list of DICOM instances metadata.
+  """
+  acquisitions = collections.defaultdict(list)
+  for instance_metadata in dicom_series_metadata:
+    acquisition_number = instance_metadata.get_value(tags.ACQUISITION_NUMBER)
+    if acquisition_number is not None:
+      acquisitions[acquisition_number].append(instance_metadata)
+  if acquisitions:
+    return acquisitions[max(acquisitions, key=lambda k: len(acquisitions[k]))]
+  return dicom_series_metadata
+
+
+def _sort_by_acquisition_time(
+    dicom_series_metadata: Sequence[dicom_web_interface.DicomObject],
+) -> Sequence[dicom_web_interface.DicomObject]:
+  """Sorts a list of DICOM instances by acquisition time."""
+  for required_tags in [
+      (tags.ACQUISITION_DATE_TIME,),
+      (tags.ACQUISITION_DATE, tags.ACQUISITION_TIME),
+  ]:
+    tag_list = []
+    for metadata in dicom_series_metadata:
+      for tag in required_tags:
+        if metadata.get_value(tag) is None:
+          break
+      else:
+        tag_list.append(metadata)
+    if tag_list:
+      break
+  else:
+    return dicom_series_metadata
+  return sorted(
+      tag_list,
+      key=lambda x: ''.join([str(x.get_value(t)) for t in required_tags]),
+  )
+
+
+def _split_instances_by_dicom_tag(
+    dicom_series_metadata: Sequence[dicom_web_interface.DicomObject],
+    tag: tags.DicomTag,
+) -> tuple[
+    Sequence[dicom_web_interface.DicomObject],
+    Sequence[dicom_web_interface.DicomObject],
+]:
+  """Splits a list of DICOM instances into lists with and without a DICOM tag."""
+  has_tag = []
+  missing_tag = []
+  for instance in dicom_series_metadata:
+    if instance.get_list_value(tag) is not None:
+      has_tag.append(instance)
+    else:
+      missing_tag.append(instance)
+  return has_tag, missing_tag
+
+
+def _remove_instances_with_duplicate_instance_numbers(
+    dicom_series_metadata: Sequence[dicom_web_interface.DicomObject],
+) -> Sequence[dicom_web_interface.DicomObject]:
+  """Removes instances with duplicate instance numbers."""
+  returned_list_dicoms = []
+  instance_numbers = set()
+  sorted_metadata = _sort_by_acquisition_time(dicom_series_metadata)
+  for instance_metadata in sorted_metadata:
+    instance_number = instance_metadata.get_value(tags.INSTANCE_NUMBER)
+    if instance_number is not None and instance_number not in instance_numbers:
+      instance_numbers.add(instance_number)
+      returned_list_dicoms.append(instance_metadata)
+  return returned_list_dicoms if returned_list_dicoms else sorted_metadata
+
+
+def _sort_by_slice_position(obj: dicom_web_interface.DicomObject) -> int:
+  img_pos_pat_zcoord_index = 0
+  try:
+    return obj.get_list_value(tags.IMAGE_POSITION_PATIENT)[
+        img_pos_pat_zcoord_index
+    ]
+  except IndexError:
+    return 0
+
+
+def _identify_dicom_series_instances_for_single_ct_or_mri_volume(
+    dicom_series_metadata: Sequence[dicom_web_interface.DicomObject],
+) -> Sequence[dicom_web_interface.DicomObject]:
+  """Identifies DICOM series instances for a single CT or MRI volume."""
+  dicom_series_metadata = _filter_image_type(dicom_series_metadata)
+  dicom_series_metadata = _filter_acquisition_number(dicom_series_metadata)
+  dicom_series_metadata, metadata_no_slice_position = (
+      _split_instances_by_dicom_tag(
+          dicom_series_metadata, tags.IMAGE_POSITION_PATIENT
+      )
+  )
+  dicom_series_metadata = _remove_instances_with_duplicate_instance_numbers(
+      dicom_series_metadata
+      if dicom_series_metadata
+      else metadata_no_slice_position
+  )
+  return sorted(
+      dicom_series_metadata,
+      key=_sort_by_slice_position,
+  )
+
+
+#  End: Utility functions to identify a single CT or MRI volume
+#  if given a series
+
+
+def validate_modality_supported(modality: str) -> None:
+  """Validates DICOM modality is supported."""
+  if modality in CXR_MODALITIES:
+    return
+  if modality in MICROSCOPY_MODALITIES:
+    return
+  if modality in MODALITY.XC:
+    return
+  if modality == MODALITY.CT:
+    return
+  if modality == MODALITY.MR:
+    return
+  raise data_accessor_errors.DicomError(
+      f'DICOM encodes a unsupported Modality; Modality: {modality}.'
+  )
+
+
 class DicomDataSourceEnum(enum.Enum):
   """Enum for DICOM data source type."""
 
@@ -62,33 +267,19 @@ class DicomDataSourceEnum(enum.Enum):
 @dataclasses.dataclass(frozen=True)
 class _DicomSourceType:
   dicom_source_type: DicomDataSourceEnum
-  dicom_instances_metadata: List[dicom_web_interface.DicomObject]
-
-
-def _get_instance_dicom_path(
-    instance: Mapping[str, Any],
-) -> dicom_path.Path:
-  """Returns normalized instance DICOM path."""
-  instance_paths = data_accessor_definition_utils.parse_dicom_source(instance)
-  if any(i.type != dicom_path.Type.INSTANCE for i in instance_paths):
-    raise data_accessor_errors.InvalidRequestFieldError(
-        f'DICOM path "{instance_paths}" does not define a SOP instance.'
-    )
-  return instance_paths[0]
+  dicom_instances_metadata: Sequence[dicom_web_interface.DicomObject]
 
 
 def _get_vl_whole_slide_microscopy_image_instances(
     selected_instance: dicom_web_interface.DicomObject,
-    instances: List[dicom_web_interface.DicomObject],
-) -> List[dicom_web_interface.DicomObject]:
+    instances: Sequence[dicom_web_interface.DicomObject],
+) -> Sequence[dicom_web_interface.DicomObject]:
   """Returns DICOM instances for VL whole slide microscopy image pyramid layer."""
   concatination_uid = selected_instance.get_value(tags.CONCATENATION_UID)
   if concatination_uid is None:
     return [selected_instance]
   found_instances = []
   for i in instances:
-    if i.sop_instance_uid != selected_instance.sop_instance_uid:
-      continue
     found_concatination_uid = i.get_value(tags.CONCATENATION_UID)
     if (
         found_concatination_uid is not None
@@ -98,12 +289,27 @@ def _get_vl_whole_slide_microscopy_image_instances(
   return found_instances
 
 
+def infer_modality_from_sop_class_uid(sop_class_uid: str) -> str:
+  """Infers modality from SOP Class UID."""
+  if sop_class_uid in _CT_SOP_CLASS_UIDS:
+    return MODALITY.CT
+  if sop_class_uid in _MR_SOP_CLASS_UIDS:
+    return MODALITY.MR
+  if sop_class_uid in _SM_SOP_CLASS_UIDS:
+    return MODALITY.SM
+  if sop_class_uid == '1.2.840.10008.5.1.4.1.1.1':
+    return MODALITY.CR
+  if sop_class_uid in _DX_SOP_CLASS_UIDS:
+    return MODALITY.DX
+  return ''
+
+
 def get_dicom_source_type(
     auth: credential_factory.AbstractCredentialFactory,
     instance: Mapping[str, Any],
 ) -> _DicomSourceType:
-  """Returns dicom source type."""
-  dcm_path = _get_instance_dicom_path(instance)
+  """Returns DICOM source type based on instance metadata."""
+  dcm_paths = data_accessor_definition_utils.parse_dicom_source(instance)
   extensions = instance.get(_InstanceJsonKeys.EXTENSIONS, {})
   ez_wsi_state = json_validation_utils.validate_str_key_dict(
       extensions.get(_EZ_WSI_STATE, {})
@@ -111,9 +317,9 @@ def get_dicom_source_type(
   if ez_wsi_state:
     return _DicomSourceType(DicomDataSourceEnum.SLIDE_MICROSCOPY_IMAGE, [])
   dwi = dicom_web_interface.DicomWebInterface(auth)
-  series_path = dcm_path.GetSeriesPath()
+  series_path = dcm_paths[0].GetSeriesPath()
   try:
-    instances = dwi.get_instances(series_path)
+    instances = dwi.get_instances(series_path, includefield='all')
   except (
       ez_wsi_errors.HttpForbiddenError,
       ez_wsi_errors.HttpUnauthorizedError,
@@ -131,28 +337,79 @@ def get_dicom_source_type(
     raise data_accessor_errors.InvalidRequestFieldError(
         f'No instances found for DICOM path: {series_path}.'
     )
-  i_uid = dcm_path.instance_uid
-  selected_instance = [i for i in instances if i.sop_instance_uid == i_uid]
-  if len(selected_instance) != 1:
+  # if dcm_path defines instances then limit series metadata to those instances.
+  if dcm_paths[0].type == dicom_path.Type.INSTANCE:
+    path_defined_sop_instances = {i.instance_uid: i for i in dcm_paths}
+    found_instances = []
+    for i in instances:
+      if i.sop_instance_uid not in path_defined_sop_instances:
+        continue
+      if i.sop_class_uid != VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_SOP_CLASS_UID:
+        found_instances.append(i)
+      else:
+        # Add VL instances implicity defined by concatenation uid.
+        found_instances.extend(
+            _get_vl_whole_slide_microscopy_image_instances(i, instances)
+        )
+    instances = found_instances
+  else:
+    path_defined_sop_instances = {}
+
+  # determine modality of instances
+  modalities = set()
+  instances_defining_known_modality = []
+  for i in instances:
+    modality = i.get_value(tags.MODALITY)
+    if modality is None:
+      modality = infer_modality_from_sop_class_uid(i.sop_class_uid)
+    if modality:
+      modalities.add(modality)
+      instances_defining_known_modality.append(i)
+  instances = instances_defining_known_modality
+  if len(modalities) > 1:
     raise data_accessor_errors.InvalidRequestFieldError(
-        f'No instance found for DICOM path: {series_path}.'
+        'DICOMweb URI defines series that contains more than one modality.'
     )
-  selected_instance = selected_instance[0]
-  if selected_instance.sop_class_uid in DICOM_MICROSCOPIC_IMAGE_IODS:
-    return _DicomSourceType(
-        DicomDataSourceEnum.SLIDE_MICROSCOPY_IMAGE,
-        [selected_instance],
+  if not modalities:
+    raise data_accessor_errors.InvalidRequestFieldError(
+        'DICOMweb URI does not define a instance with a recognized modality.'
     )
-  elif (
-      selected_instance.sop_class_uid
-      == VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_SOP_CLASS_UID
+  modality = modalities.pop().upper()
+  validate_modality_supported(modality)
+
+  if (
+      modality != MODALITY.SM
+      and dcm_paths[0].type == dicom_path.Type.SERIES
+      and modality in CT_AND_MRI_MODALITIES
   ):
-    return _DicomSourceType(
-        DicomDataSourceEnum.SLIDE_MICROSCOPY_IMAGE,
-        _get_vl_whole_slide_microscopy_image_instances(
-            selected_instance, instances
-        ),
+    # if CT or MRI volume then identify single volume is defined by series.
+    # Identify set of instances that define a single CT or MRI volume.
+    instances = _identify_dicom_series_instances_for_single_ct_or_mri_volume(
+        instances
+    )
+
+  if path_defined_sop_instances:
+    # Test if instances are defined by sop_instance_uid then that the instance
+    # metadata being returned is a super set of the defined intances.
+    identified_sop_instances = {i.sop_instance_uid for i in instances}
+    for path_sop_instance in path_defined_sop_instances:
+      if path_sop_instance not in identified_sop_instances:
+        raise data_accessor_errors.InvalidRequestFieldError(
+            f'DICOMweb URI defines invalid sop instance: {path_sop_instance}.'
+        )
+
+  if modality != MODALITY.SM:
+    return _DicomSourceType(DicomDataSourceEnum.GENERIC_DICOM, instances)
+  sop_class_uids = {i.sop_class_uid for i in instances}
+  if (
+      len(sop_class_uids) > 1
+      and VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_SOP_CLASS_UID in sop_class_uids
+  ):
+    raise data_accessor_errors.InvalidRequestFieldError(
+        'DICOMweb URI define both VL_WHOLE_SLIDE_MICROSCOPY_IMAGE IOD and other'
+        ' IODs.'
     )
   return _DicomSourceType(
-      DicomDataSourceEnum.GENERIC_DICOM, [selected_instance]
+      DicomDataSourceEnum.SLIDE_MICROSCOPY_IMAGE,
+      instances,
   )

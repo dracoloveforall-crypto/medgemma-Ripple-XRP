@@ -375,22 +375,28 @@ class DataAccessorTest(parameterized.TestCase):
         _InstanceJsonKeys.GCS_URI: 'gs://earth/image.dcm',
     }
     json_instance.update(metadata)
-    instance = data_accessor_definition.json_to_generic_gcs_image(
-        credential_factory_module.NoAuthCredentialsFactory(),
-        json_instance,
-        default_patch_width=256,
-        default_patch_height=256,
-        require_patch_dim_match_default_dim=False,
+    temp_dir = self.create_tempdir()
+    shutil.copyfile(
+        test_utils.testdata_path('cxr', 'encapsulated_cxr.dcm'),
+        os.path.join(temp_dir, 'image.dcm'),
     )
-    gcs_data_accessor = data_accessor.GcsGenericData(
-        instance,
-        file_handlers=[
-            traditional_image_handler.TraditionalImageHandler(),
-            generic_dicom_handler.GenericDicomHandler(),
-        ],
-        download_worker_count=1,
-    )
-    self.assertLen(gcs_data_accessor, expected)
+    with gcs_mock.GcsMock({'earth': temp_dir}):
+      instance = data_accessor_definition.json_to_generic_gcs_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          json_instance,
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
+      )
+      gcs_data_accessor = data_accessor.GcsGenericData(
+          instance,
+          file_handlers=[
+              traditional_image_handler.TraditionalImageHandler(),
+              generic_dicom_handler.GenericDicomHandler(),
+          ],
+          download_worker_count=1,
+      )
+      self.assertLen(gcs_data_accessor, expected)
 
   @parameterized.named_parameters(
       dict(
@@ -450,9 +456,7 @@ class DataAccessorTest(parameterized.TestCase):
   @mock.patch(
       'google.cloud.storage.Client.create_anonymous_client', autospec=True
   )
-  def test_gcs_dicom_image_no_auth(
-      self, anonymous_client_mock, *_
-  ):
+  def test_gcs_dicom_image_no_auth(self, anonymous_client_mock, *_):
     json_instance = {_InstanceJsonKeys.GCS_URI: 'gs://earth/image.dcm'}
     auth = authentication_utils.create_auth_from_instance(
         json_instance.get('access_credential', '')
@@ -475,6 +479,120 @@ class DataAccessorTest(parameterized.TestCase):
     with contextlib.ExitStack() as stack:
       gcs_data_accessor.load_data(stack)
       anonymous_client_mock.assert_called_once()
+
+  @parameterized.parameters([0, 1, 2])
+  def test_download_multiple_files(self, max_parallel_download_workers):
+    json_instance = {
+        _InstanceJsonKeys.GCS_SOURCE: [
+            'gs://earth/image.dcm',
+            'gs://earth/image.dcm',
+        ],
+    }
+    temp_dir = self.create_tempdir()
+    shutil.copyfile(
+        test_utils.testdata_path('cxr', 'encapsulated_cxr.dcm'),
+        os.path.join(temp_dir, 'image.dcm'),
+    )
+    with gcs_mock.GcsMock({'earth': temp_dir}):
+      instance = data_accessor_definition.json_to_generic_gcs_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          json_instance,
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
+      )
+      gcs_data_accessor = data_accessor.GcsGenericData(
+          instance,
+          file_handlers=[
+              traditional_image_handler.TraditionalImageHandler(),
+              generic_dicom_handler.GenericDicomHandler(),
+          ],
+          download_worker_count=1,
+          max_parallel_download_workers=max_parallel_download_workers,
+      )
+      with contextlib.ExitStack() as stack:
+        gcs_data_accessor.load_data(stack)
+        gcs_data_accessor.load_data(stack)
+        self.assertLen(gcs_data_accessor, 2)
+
+  def test_missing_gcs_uri_raises(self):
+    with self.assertRaisesRegex(
+        data_accessor_errors.InvalidRequestFieldError, '.*GCS URI not defined.*'
+    ):
+      data_accessor_definition.json_to_generic_gcs_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          {},
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
+      )
+
+  def test_missing_gcs_source_empty_list_raises(self):
+    with self.assertRaisesRegex(
+        data_accessor_errors.InvalidRequestFieldError,
+        '.*gcs_source is an empty list.*',
+    ):
+      data_accessor_definition.json_to_generic_gcs_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          {'gcs_source': []},
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
+      )
+
+  @parameterized.parameters([1, '', 'gs://foo'])
+  def test_missing_gcs_source_contains_invalid_value_string_raises(self, value):
+    with self.assertRaisesRegex(
+        data_accessor_errors.InvalidRequestFieldError, '.*invalid GCS URI;.*'
+    ):
+      data_accessor_definition.json_to_generic_gcs_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          {'gcs_source': [value]},
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
+      )
+
+  @parameterized.parameters([0, 1, 2])
+  def test_decode_dicom_and_traditional_images(
+      self, max_parallel_download_workers
+  ):
+    temp_dir = self.create_tempdir()
+    with gcs_mock.GcsMock({'earth': temp_dir}):
+      instance = data_accessor_definition.json_to_generic_gcs_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          {
+              'gcs_source': [
+                  'gs://earth/image.dcm',
+                  'gs://earth/image.jpeg',
+                  'gs://earth/image.dcm',
+                  'gs://earth/image.jpeg',
+              ]
+          },
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
+      )
+      gcs_data_accessor = data_accessor.GcsGenericData(
+          instance,
+          file_handlers=[
+              traditional_image_handler.TraditionalImageHandler(),
+              generic_dicom_handler.GenericDicomHandler(),
+          ],
+          download_worker_count=1,
+          max_parallel_download_workers=max_parallel_download_workers,
+      )
+      shutil.copyfile(
+          test_utils.testdata_path('cxr', 'encapsulated_cxr.dcm'),
+          os.path.join(temp_dir, 'image.dcm'),
+      )
+      shutil.copyfile(
+          test_utils.testdata_path('image.jpeg'),
+          os.path.join(temp_dir, 'image.jpeg'),
+      )
+      with contextlib.ExitStack() as stack:
+        gcs_data_accessor.load_data(stack)
+        self.assertLen(gcs_data_accessor, 4)
 
 
 if __name__ == '__main__':

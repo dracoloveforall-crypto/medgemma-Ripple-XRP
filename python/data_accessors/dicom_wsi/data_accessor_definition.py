@@ -16,7 +16,7 @@
 
 import dataclasses
 import json
-from typing import Any, List, Mapping
+from typing import Any, Mapping, Sequence
 
 from ez_wsi_dicomweb import credential_factory as credential_factory_module
 from ez_wsi_dicomweb import dicom_web_interface
@@ -32,20 +32,15 @@ from data_accessors.utils import patch_coordinate as patch_coordinate_module
 _InstanceJsonKeys = data_accessor_const.InstanceJsonKeys
 
 
-class _InstanceUIDMetadataError(Exception):
-  pass
-
-
 @dataclasses.dataclass(frozen=True)
 class DicomWSIImage:
   """An instance in a DICOM Embedding Request as described in the schema file."""
 
   credential_factory: credential_factory_module.AbstractCredentialFactory
-  series_path: str
+  dicomweb_paths: Sequence[dicom_path.Path]
   extensions: Mapping[str, Any]
-  instance_uid: str
-  patch_coordinates: List[patch_coordinate_module.PatchCoordinate]
-  dicom_instances_metadata: List[dicom_web_interface.DicomObject]
+  patch_coordinates: Sequence[patch_coordinate_module.PatchCoordinate]
+  dicom_instances_metadata: Sequence[dicom_web_interface.DicomObject]
 
 
 def _generate_instance_metadata_error_string(
@@ -81,7 +76,7 @@ def json_to_dicom_wsi_image(
     credential_factory: credential_factory_module.AbstractCredentialFactory,
     instance: Mapping[str, Any],
     settings: configuration.ConfigurationSettings,
-    dicom_instances_metadata: List[dicom_web_interface.DicomObject],
+    dicom_instances_metadata: Sequence[dicom_web_interface.DicomObject],
 ) -> DicomWSIImage:
   """Converts json to DicomWSIImage."""
   try:
@@ -100,43 +95,14 @@ def json_to_dicom_wsi_image(
         f'Invalid patch coordinate; {exp}; {instance_error_msg}'
     ) from exp
 
-  instance_paths = data_accessor_definition_utils.parse_dicom_source(instance)
-  if len(instance_paths) > 1:
-    raise data_accessor_errors.InvalidRequestFieldError(
-        'Endpoint does not support definitions with multiple digital pathology '
-        'DICOMweb URIs in a dicom_source.'
-    )
-  dcm_path = instance_paths[0]
-  if dcm_path.type != dicom_path.Type.INSTANCE:
-    raise data_accessor_errors.InvalidRequestFieldError(
-        f'Unsupported DICOM source "{dcm_path}". Required to define a DICOM SOP'
-        ' Instance.'
-    )
+  dicomweb_paths = data_accessor_definition_utils.parse_dicom_source(instance)
   try:
-    return DicomWSIImage(
-        credential_factory=credential_factory,
-        series_path=dcm_path.GetSeriesPath().complete_url,
-        extensions=json_validation_utils.validate_str_key_dict(
-            instance.get(
-                _InstanceJsonKeys.EXTENSIONS,
-                {},
-            )
-        ),
-        instance_uid=dcm_path.instance_uid,
-        patch_coordinates=patch_coordinates,
-        dicom_instances_metadata=dicom_instances_metadata,
+    extensions = json_validation_utils.validate_str_key_dict(
+        instance.get(
+            _InstanceJsonKeys.EXTENSIONS,
+            {},
+        )
     )
-  except _InstanceUIDMetadataError as exp:
-    error_msg = _generate_instance_metadata_error_string(
-        instance,
-        _InstanceJsonKeys.DICOM_SOURCE,
-        _InstanceJsonKeys.DICOM_WEB_URI,
-        _InstanceJsonKeys.BEARER_TOKEN,
-        _InstanceJsonKeys.EXTENSIONS,
-    )
-    raise data_accessor_errors.InvalidRequestFieldError(
-        f'Invalid DICOM SOP Instance UID metadata; {error_msg}'
-    ) from exp
   except json_validation_utils.ValidationError as exp:
     error_msg = _generate_instance_metadata_error_string(
         instance,
@@ -148,3 +114,10 @@ def json_to_dicom_wsi_image(
     raise data_accessor_errors.InvalidRequestFieldError(
         f'DICOM instance JSON formatting is invalid; {error_msg}'
     ) from exp
+  return DicomWSIImage(
+      credential_factory=credential_factory,
+      dicomweb_paths=dicomweb_paths,
+      extensions=extensions,
+      patch_coordinates=patch_coordinates,
+      dicom_instances_metadata=dicom_instances_metadata,
+  )

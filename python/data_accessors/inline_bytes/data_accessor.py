@@ -20,7 +20,6 @@ from typing import Iterator, Sequence
 import numpy as np
 
 from data_accessors import abstract_data_accessor
-from data_accessors import data_accessor_errors
 from data_accessors.inline_bytes import data_accessor_definition
 from data_accessors.local_file_handlers import abstract_handler
 
@@ -29,22 +28,14 @@ def _get_generic_bytes_images(
     file_handlers: Sequence[abstract_handler.AbstractHandler],
     instance: data_accessor_definition.InlineBytes,
 ) -> Iterator[np.ndarray]:
-  """Returns image patch bytes from DICOM series."""
+  """Returns image patch bytes from inline bytes."""
   with io.BytesIO(instance.input_bytes) as input_bytes:
-    for file_handler in file_handlers:
-      input_bytes.seek(0)
-      processed = file_handler.process_file(
-          instance.patch_coordinates, instance.base_request, input_bytes
-      )
-      yield_result = False
-      for data in processed:
-        yield data
-        yield_result = True
-      if yield_result:
-        return
-  raise data_accessor_errors.UnhandledGenericBytesError(
-      'No file handler processed the bytes.'
-  )
+    yield from abstract_handler.process_files_with_handlers(
+        file_handlers,
+        instance.patch_coordinates,
+        instance.base_request,
+        [input_bytes],
+    )
 
 
 class InlineBytesData(
@@ -72,8 +63,3 @@ class InlineBytesData(
     """Method pre-loads data prior to data_iterator."""
     return
 
-  def __len__(self) -> int:
-    """Returns number of data sets returned by iterator."""
-    if self.instance.patch_coordinates:
-      return len(self.instance.patch_coordinates)
-    return 1

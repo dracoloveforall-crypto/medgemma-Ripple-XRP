@@ -16,7 +16,7 @@
 
 import dataclasses
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Never, Optional, Sequence
 
 from ez_wsi_dicomweb import credential_factory as credential_factory_module
 import google.cloud.storage
@@ -33,7 +33,7 @@ _PRESENT = 'PRESENT'
 @dataclasses.dataclass(frozen=True)
 class GcsGenericBlob:
   credential_factory: credential_factory_module.AbstractCredentialFactory
-  gcs_blob: google.cloud.storage.Blob
+  gcs_blobs: Sequence[google.cloud.storage.Blob]
   base_request: Mapping[str, Any]
   patch_coordinates: Sequence[patch_coordinate_module.PatchCoordinate]
 
@@ -55,6 +55,28 @@ def _generate_instance_metadata_error_string(
     # otherwise just associate key and value.
     result[key] = metadata[key]
   return json.dumps(result, sort_keys=True)
+
+
+def _raise_exception(
+    msg: str,
+    exp: Optional[Exception],
+    instance: Mapping[str, Any],
+) -> Never:
+  """Raises an exception with a consistent error message."""
+  error_msg = _generate_instance_metadata_error_string(
+      instance,
+      _InstanceJsonKeys.GCS_URI,
+      _InstanceJsonKeys.GCS_SOURCE,
+      _InstanceJsonKeys.BEARER_TOKEN,
+      _InstanceJsonKeys.EXTENSIONS,
+  )
+  if exp is not None:
+    raise data_accessor_errors.InvalidRequestFieldError(
+        f'DICOM instance JSON formatting is invalid; {msg}; {error_msg}'
+    ) from exp
+  raise data_accessor_errors.InvalidRequestFieldError(
+      f'DICOM instance JSON formatting is invalid; {msg}; {error_msg}'
+  )
 
 
 def json_to_generic_gcs_image(
@@ -82,50 +104,30 @@ def json_to_generic_gcs_image(
     ) from exp
 
   if _InstanceJsonKeys.GCS_SOURCE in instance:
-    gcs_uri = instance.get(_InstanceJsonKeys.GCS_SOURCE, '')
-    if isinstance(gcs_uri, list):
-      if not gcs_uri:
-        raise data_accessor_errors.InvalidRequestFieldError(
-            'gcs_source is an empty list.'
-        )
-      if len(gcs_uri) > 1:
-        raise data_accessor_errors.InvalidRequestFieldError(
-            'Endpoint does not support definitions with multiple GCS URIs'
-            ' in a gcs_source.'
-        )
-      gcs_uri = gcs_uri[0]
+    gcs_uris = instance.get(_InstanceJsonKeys.GCS_SOURCE, '')
+    if isinstance(gcs_uris, list):
+      if not gcs_uris:
+        _raise_exception('gcs_source is an empty list', None, instance)
+    else:
+      gcs_uris = [gcs_uris]
   elif _InstanceJsonKeys.GCS_URI in instance:
     # Legacy support for decoding GCS_URI used in MedSigLip Endpoint.
-    gcs_uri = instance.get(_InstanceJsonKeys.GCS_URI, '')
+    gcs_uris = [instance.get(_InstanceJsonKeys.GCS_URI, '')]
   else:
-    raise data_accessor_errors.InvalidRequestFieldError('GCS URI not defined.')
-  try:
-    gcs_uri = json_validation_utils.validate_not_empty_str(gcs_uri)
-  except ValueError as exp:
-    raise data_accessor_errors.InvalidRequestFieldError(
-        f'Invalid gcs uri; {gcs_uri}.'
-    ) from exp
-  try:
-    gcs_blob = google.cloud.storage.Blob.from_string(gcs_uri)
-  except ValueError as exp:
-    raise data_accessor_errors.InvalidRequestFieldError(
-        f'Invalid gcs uri; {gcs_uri}.'
-    ) from exp
-  try:
-    return GcsGenericBlob(
-        credential_factory=credential_factory,
-        gcs_blob=gcs_blob,
-        base_request=instance,
-        patch_coordinates=patch_coordinates,
-    )
-  except json_validation_utils.ValidationError as exp:
-    error_msg = _generate_instance_metadata_error_string(
-        instance,
-        _InstanceJsonKeys.GCS_URI,
-        _InstanceJsonKeys.GCS_SOURCE,
-        _InstanceJsonKeys.BEARER_TOKEN,
-        _InstanceJsonKeys.EXTENSIONS,
-    )
-    raise data_accessor_errors.InvalidRequestFieldError(
-        f'DICOM instance JSON formatting is invalid; {error_msg}'
-    ) from exp
+    _raise_exception('GCS URI not defined', None, instance)
+  gcs_blobs = []
+  for uri in gcs_uris:
+    try:
+      json_validation_utils.validate_not_empty_str(uri)
+    except (ValueError, json_validation_utils.ValidationError) as exp:
+      _raise_exception('invalid GCS URI', exp, instance)
+    try:
+      gcs_blobs.append(google.cloud.storage.Blob.from_string(uri))
+    except ValueError as exp:
+      _raise_exception('invalid GCS URI', exp, instance)
+  return GcsGenericBlob(
+      credential_factory=credential_factory,
+      gcs_blobs=gcs_blobs,
+      base_request=instance,
+      patch_coordinates=patch_coordinates,
+  )

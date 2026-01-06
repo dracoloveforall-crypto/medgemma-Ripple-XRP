@@ -14,15 +14,18 @@
 """Data accessor for generic DICOM images stored in a DICOM store."""
 
 import base64
+from concurrent import futures
 import contextlib
+import functools
 import os
 import re
 import tempfile
 from typing import Iterator, Sequence
-import urllib.parse
 
+from ez_wsi_dicomweb import error_retry_util
 import numpy as np
 import requests
+import retrying
 
 from data_accessors import abstract_data_accessor
 from data_accessors import data_accessor_errors
@@ -35,33 +38,19 @@ _INLINE_IMAGE_REGEX = re.compile(
 )
 
 
-def _download_http_image(
-    stack: contextlib.ExitStack,
+@retrying.retry(**error_retry_util.HTTP_SERVER_ERROR_RETRY_CONFIG)
+def _retry_http_image_download(
     instance: data_accessor_definition.HttpImage,
-) -> str:
-  """Downloads DICOM instance to a local file."""
-  temp_dir = stack.enter_context(tempfile.TemporaryDirectory())
-  match = _INLINE_IMAGE_REGEX.fullmatch(instance.url)
-  if match is not None:  # if inline embedded base64 encoded image.
-    # use mime type as extension
-    ext = match.group(1).lower()
-    # get base64 encoded image bytes
-    base64_encoded_image = match.group(2)
-    local_filename = os.path.join(temp_dir, f'inline_image.{ext}')
-    # decode base64 and write to local file
-    with open(local_filename, 'wb') as output_file:
-      output_file.write(base64.b64decode(base64_encoded_image))
-    return local_filename
-
-  parsed_url = urllib.parse.urlparse(instance.url)
-  url_filename = os.path.basename(parsed_url.path)
-  local_filename = os.path.join(temp_dir, url_filename)
+    url_local_filename: tuple[str, str],
+) -> None:
+  """Retries HTTP image download."""
+  url, local_filename = url_local_filename
   with open(local_filename, 'wb') as output_file:
     try:
       headers = {'accept': '*/*', 'User-Agent': 'http-image-data-accessor'}
       instance.credential_factory.get_credentials().apply(headers)
       with requests.get(
-          instance.url,
+          url,
           headers=headers,
           stream=True,
       ) as r:
@@ -70,36 +59,46 @@ def _download_http_image(
           output_file.write(chunk)
     except requests.RequestException as e:
       raise data_accessor_errors.UnhandledHttpFileError(
-          f'A error occurred downloading the image from:  {instance.url}; {e}'
+          f'A error occurred downloading the image from:  {url}; {e}'
       ) from e
-  return local_filename
 
 
-def _get_http_image(
+def _download_http_images(
+    stack: contextlib.ExitStack,
     instance: data_accessor_definition.HttpImage,
-    file_handlers: Sequence[abstract_handler.AbstractHandler],
-    local_file_path: str,
-) -> Iterator[np.ndarray]:
-  """Returns image patch bytes from DICOM series."""
-  with contextlib.ExitStack() as stack:
-    if not local_file_path:
-      local_file_path = _download_http_image(stack, instance)
-    for file_handler in file_handlers:
-      processed = file_handler.process_file(
-          instance.patch_coordinates,
-          instance.base_request,
-          local_file_path,
+    max_parallel_download_workers: int,
+) -> Sequence[str]:
+  """Downloads DICOM instance to a local file."""
+  temp_dir = stack.enter_context(tempfile.TemporaryDirectory())
+  local_filenames = []
+  http_download_list = []
+  for index, url in enumerate(instance.urls):
+    local_filename = os.path.join(temp_dir, f'{index}.tmp')
+    match = _INLINE_IMAGE_REGEX.fullmatch(url)
+    if match is not None:  # if inline embedded base64 encoded image.
+      # get base64 encoded image bytes
+      base64_encoded_image = match.group(2)
+      # decode base64 and write to local file
+      with open(local_filename, 'wb') as output_file:
+        output_file.write(base64.b64decode(base64_encoded_image))
+      local_filenames.append(local_filename)
+      continue
+    http_download_list.append((url, local_filename))
+    local_filenames.append(local_filename)
+  if len(http_download_list) == 1 or max_parallel_download_workers == 1:
+    for http_download in http_download_list:
+      _retry_http_image_download(instance, http_download)
+  elif len(http_download_list) > 1:
+    with futures.ThreadPoolExecutor(
+        max_workers=max_parallel_download_workers
+    ) as executor:
+      list(
+          executor.map(
+              functools.partial(_retry_http_image_download, instance),
+              http_download_list,
+          )
       )
-      yield_result = False
-      for data in processed:
-        yield data
-        yield_result = True
-      if yield_result:
-        return
-
-  raise data_accessor_errors.UnhandledHttpFileError(
-      'No file handler processed the files.'
-  )
+  return local_filenames
 
 
 class HttpImageData(
@@ -113,18 +112,20 @@ class HttpImageData(
       self,
       instance_class: data_accessor_definition.HttpImage,
       file_handlers: Sequence[abstract_handler.AbstractHandler],
+      max_parallel_download_workers: int = 1,
   ):
     super().__init__(instance_class)
     self._file_handlers = file_handlers
-    self._local_file_path = ''
+    self._local_file_paths = []
+    self._max_parallel_download_workers = max(1, max_parallel_download_workers)
 
   @contextlib.contextmanager
-  def _reset_local_file_path(self, *args, **kwds):
+  def _reset_local_file_paths(self, *args, **kwds):
     del args, kwds
     try:
       yield
     finally:
-      self._local_file_path = ''
+      self._local_file_paths = []
 
   def load_data(self, stack: contextlib.ExitStack) -> None:
     """Method pre-loads data prior to data_iterator.
@@ -138,22 +139,28 @@ class HttpImageData(
     Returns:
       None
     """
-    if self._local_file_path:
+    if self._local_file_paths:
       return
-    self._local_file_path = _download_http_image(stack, self.instance)
-    stack.enter_context(self._reset_local_file_path())
+    self._local_file_paths = _download_http_images(
+        stack, self.instance, self._max_parallel_download_workers
+    )
+    stack.enter_context(self._reset_local_file_paths())
 
   def data_iterator(self) -> Iterator[np.ndarray]:
-    return _get_http_image(
-        self.instance, self._file_handlers, self._local_file_path
-    )
+    with contextlib.ExitStack() as stack:
+      if self._local_file_paths:
+        local_file_paths = self._local_file_paths
+      else:
+        local_file_paths = _download_http_images(
+            stack, self.instance, self._max_parallel_download_workers
+        )
+      yield from abstract_handler.process_files_with_handlers(
+          self._file_handlers,
+          self.instance.patch_coordinates,
+          self.instance.base_request,
+          local_file_paths,
+      )
 
   def is_accessor_data_embedded_in_request(self) -> bool:
     """Returns true if data is inline with request."""
     return False
-
-  def __len__(self) -> int:
-    """Returns number of data sets returned by iterator."""
-    if self.instance.patch_coordinates:
-      return len(self.instance.patch_coordinates)
-    return 1

@@ -16,7 +16,7 @@
 
 import dataclasses
 import json
-from typing import Any, List, Mapping
+from typing import Any, Mapping, Sequence, Union
 
 from ez_wsi_dicomweb import credential_factory as credential_factory_module
 
@@ -31,9 +31,9 @@ _PRESENT = 'PRESENT'
 @dataclasses.dataclass(frozen=True)
 class HttpImage:
   credential_factory: credential_factory_module.AbstractCredentialFactory
-  url: str
+  urls: Sequence[str]
   base_request: Mapping[str, Any]
-  patch_coordinates: List[patch_coordinate_module.PatchCoordinate]
+  patch_coordinates: Sequence[patch_coordinate_module.PatchCoordinate]
 
 
 def _generate_instance_metadata_error_string(
@@ -53,6 +53,27 @@ def _generate_instance_metadata_error_string(
     # otherwise just associate key and value.
     result[key] = metadata[key]
   return json.dumps(result, sort_keys=True)
+
+
+def _parse_url(image_url_dict: Union[Mapping[str, Any], str]) -> str:
+  """Parses URL from image_url dict."""
+  if isinstance(image_url_dict, Mapping):
+    image_url_dict = image_url_dict.get(_InstanceJsonKeys.URL)
+    if image_url_dict is None:
+      raise data_accessor_errors.InvalidRequestFieldError(
+          'Missing URL in image_url dict.'
+      )
+  if isinstance(image_url_dict, str):
+    url = image_url_dict
+  else:
+    raise data_accessor_errors.InvalidRequestFieldError(
+        'Invalid URL, must be a string.'
+    )
+  if not url:
+    raise data_accessor_errors.InvalidRequestFieldError(
+        'Invalid URL, must be not emptyt.'
+    )
+  return url
 
 
 def json_to_http_image(
@@ -78,17 +99,19 @@ def json_to_http_image(
     raise data_accessor_errors.InvalidRequestFieldError(
         f'Invalid patch coordinate; {exp}; {instance_error_msg}'
     ) from exp
-  image_url_dict = instance.get(_InstanceJsonKeys.IMAGE_URL)
-  if image_url_dict is None:
-    url = instance.get(_InstanceJsonKeys.URL)
-  elif isinstance(image_url_dict, str):
-    url = image_url_dict
-  elif isinstance(image_url_dict, Mapping):
-    url = image_url_dict.get(_InstanceJsonKeys.URL)
+  urls = []
+  image_urls = instance.get(_InstanceJsonKeys.IMAGE_URL)
+  if image_urls is None:
+    image_urls = instance.get(_InstanceJsonKeys.URL)
+    if image_urls is None:
+      raise data_accessor_errors.InvalidRequestFieldError(
+          'Missing URL in image_url dict.'
+      )
+  if isinstance(image_urls, list):
+    if not image_urls:
+      raise data_accessor_errors.InvalidRequestFieldError('Empty URL list.')
+    for url in image_urls:
+      urls.append(_parse_url(url))
   else:
-    url = None
-  if url is None or not isinstance(url, str) or not url:
-    raise data_accessor_errors.InvalidRequestFieldError(
-        'Missing URL in image_url dict.'
-    )
-  return HttpImage(credential_factory, url, instance, patch_coordinates)
+    urls.append(_parse_url(image_urls))
+  return HttpImage(credential_factory, urls, instance, patch_coordinates)

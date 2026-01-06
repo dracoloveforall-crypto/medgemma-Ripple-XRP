@@ -14,6 +14,7 @@
 """Tests for http_generic data accessor."""
 
 import base64
+import contextlib
 from typing import Any, Mapping, Sequence
 from unittest import mock
 
@@ -43,6 +44,7 @@ def _test_load_from_http(
     credential_factory: credential_factory_module.AbstractCredentialFactory,
     json_instance: Mapping[str, Any],
     source_image_path: str,
+    max_parallel_download_workers: int,
 ) -> Sequence[np.ndarray]:
   with open(source_image_path, 'rb') as f:
     data = f.read()
@@ -58,6 +60,7 @@ def _test_load_from_http(
     http_data_accessor = data_accessor.HttpImageData(
         instance,
         file_handlers=file_handlers,
+        max_parallel_download_workers=max_parallel_download_workers,
     )
     return list(http_data_accessor.data_iterator())
 
@@ -66,6 +69,7 @@ def _test_load_image_from_http(
     credential_factory: credential_factory_module.AbstractCredentialFactory,
     json_instance: Mapping[str, Any],
     source_image_path: str,
+    max_parallel_download_workers: int = 1,
 ) -> Sequence[np.ndarray]:
   return _test_load_from_http(
       [
@@ -76,6 +80,7 @@ def _test_load_image_from_http(
       credential_factory,
       json_instance,
       source_image_path,
+      max_parallel_download_workers,
   )
 
 
@@ -83,6 +88,7 @@ def _test_load_generic_dicom_from_http(
     credential_factory: credential_factory_module.AbstractCredentialFactory,
     json_instance: Mapping[str, Any],
     source_image_path: str,
+    max_parallel_download_workers: int = 1,
 ) -> Sequence[np.ndarray]:
   return _test_load_from_http(
       [
@@ -93,6 +99,7 @@ def _test_load_generic_dicom_from_http(
       credential_factory,
       json_instance,
       source_image_path,
+      max_parallel_download_workers,
   )
 
 
@@ -365,7 +372,13 @@ class DataAccessorTest(parameterized.TestCase):
             generic_dicom_handler.GenericDicomHandler(),
         ],
     )
-    self.assertLen(http_data_accessor, expected)
+    with open(
+        test_utils.testdata_path('cxr', 'encapsulated_cxr.dcm'), 'rb'
+    ) as infile:
+      data = infile.read()
+    with requests_mock.Mocker() as m:
+      m.get('http://earth.com/image.dcm', content=data)
+      self.assertLen(http_data_accessor, expected)
 
   @parameterized.named_parameters(
       dict(
@@ -425,6 +438,102 @@ class DataAccessorTest(parameterized.TestCase):
           credential_factory_module.NoAuthCredentialsFactory(),
           json_instance,
           test_utils.testdata_path('cxr', 'encapsulated_cxr.dcm'),
+      )
+
+  @parameterized.parameters([0, 1, 2])
+  def test_loading_multiple_images_via_http(
+      self, max_parallel_download_workers
+  ):
+    json_instance = {
+        _InstanceJsonKeys.URL: [
+            'http://earth.com/image.jpeg',
+            'http://earth.com/image.jpeg',
+        ],
+    }
+    results = _test_load_image_from_http(
+        credential_factory_module.NoAuthCredentialsFactory(),
+        json_instance,
+        test_utils.testdata_path('image.jpeg'),
+        max_parallel_download_workers=max_parallel_download_workers,
+    )
+    self.assertLen(results, 2)
+    self.assertEqual(results[0].shape, (67, 100, 3))
+    self.assertEqual(results[1].shape, (67, 100, 3))
+
+  @parameterized.parameters([0, 1, 2])
+  def test_preloading_loading_multiple_images_via_http(
+      self, max_parallel_download_workers
+  ):
+    json_instance = {
+        _InstanceJsonKeys.URL: [
+            'http://earth.com/image.jpeg',
+            'http://earth.com/image.jpeg',
+        ],
+    }
+    source_image_path = test_utils.testdata_path('image.jpeg')
+    with open(source_image_path, 'rb') as f:
+      data = f.read()
+    with requests_mock.Mocker() as m:
+      m.get('http://earth.com/image.jpeg', content=data)
+      instance = data_accessor_definition.json_to_http_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          json_instance,
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
+      )
+      http_data_accessor = data_accessor.HttpImageData(
+          instance,
+          file_handlers=[
+              generic_dicom_handler.GenericDicomHandler(),
+              traditional_image_handler.TraditionalImageHandler(),
+          ],
+          max_parallel_download_workers=max_parallel_download_workers,
+      )
+      with contextlib.ExitStack() as stack:
+        http_data_accessor.load_data(stack)
+        http_data_accessor.load_data(stack)
+        results = list(http_data_accessor.data_iterator())
+    self.assertLen(results, 2)
+    self.assertEqual(results[0].shape, (67, 100, 3))
+    self.assertEqual(results[1].shape, (67, 100, 3))
+
+  def test_empty_url_list_raises(self):
+    with self.assertRaisesRegex(
+        data_accessor_errors.InvalidRequestFieldError, '.*Empty URL list.*'
+    ):
+      data_accessor_definition.json_to_http_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          {_InstanceJsonKeys.URL: []},
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
+      )
+
+  def test_non_string_url_raises(self):
+    with self.assertRaisesRegex(
+        data_accessor_errors.InvalidRequestFieldError,
+        '.*Invalid URL, must be a string.*',
+    ):
+      data_accessor_definition.json_to_http_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          {_InstanceJsonKeys.URL: 123},
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
+      )
+
+  def test_empty_string_url_raises(self):
+    with self.assertRaisesRegex(
+        data_accessor_errors.InvalidRequestFieldError,
+        '.*Invalid URL, must be not empty.*',
+    ):
+      data_accessor_definition.json_to_http_image(
+          credential_factory_module.NoAuthCredentialsFactory(),
+          {_InstanceJsonKeys.URL: ''},
+          default_patch_width=256,
+          default_patch_height=256,
+          require_patch_dim_match_default_dim=False,
       )
 
 

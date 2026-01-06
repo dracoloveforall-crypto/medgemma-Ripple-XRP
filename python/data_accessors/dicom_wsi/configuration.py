@@ -34,4 +34,5 @@ class ConfigurationSettings:
   approved_dicom_stores: Optional[Sequence[str]]
   icc_profile_cache_configuration: IccProfileCacheConfiguration
   require_patch_dim_match_default_dim: bool = False
+  max_parallel_download_workers: int = 1
 

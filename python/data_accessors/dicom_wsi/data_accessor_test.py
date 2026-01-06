@@ -14,6 +14,7 @@
 
 """Unit tests for pathology 2.0 endpoint predictor."""
 
+import contextlib
 import dataclasses
 import json
 import typing
@@ -35,9 +36,9 @@ from data_accessors.dicom_wsi import configuration
 from data_accessors.dicom_wsi import data_accessor
 from data_accessors.dicom_wsi import data_accessor_definition
 from data_accessors.dicom_wsi import icc_profile_cache
-from data_accessors.dicom_wsi.test_utils import test_files
 from data_accessors.utils import image_dimension_utils
 from data_accessors.utils import patch_coordinate
+from data_accessors.utils import test_utils
 from serving.serving_framework import model_runner
 from ez_wsi_dicomweb.test_utils.dicom_store_mock import dicom_store_mock
 
@@ -52,9 +53,9 @@ _DEBUG_SETTINGS = configuration.ConfigurationSettings(
 )
 
 
-def _dicom_series_path(dcm: pydicom.Dataset) -> dicom_path.Path:
+def _dicom_instance_path(dcm: pydicom.Dataset) -> dicom_path.Path:
   return dicom_path.FromString(
-      f'/projects/project/locations/location/datasets/dataset/dicomStores/dicomstore/dicomWeb/studies/{dcm.StudyInstanceUID}/series/{dcm.SeriesInstanceUID}'
+      f'/projects/project/locations/location/datasets/dataset/dicomStores/dicomstore/dicomWeb/studies/{dcm.StudyInstanceUID}/series/{dcm.SeriesInstanceUID}/instances/{dcm.SOPInstanceUID}'
   )
 
 
@@ -73,9 +74,10 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_get_dicom_patches_instance_not_found(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -83,12 +85,18 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
             default_height=_DEBUG_SETTINGS.endpoint_input_height,
         )
     ]
-    instance = data_accessor_definition.DicomWSIImage(
+    path = _dicom_instance_path(dcm)
+    instance = data_accessor_definition.json_to_dicom_wsi_image(
         credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-        str(path),
-        {},
-        '1.42',
-        coordinates,
+        {
+            _InstanceJsonKeys.PATCH_COORDINATES: [
+                dataclasses.asdict(c) for c in coordinates
+            ],
+            _InstanceJsonKeys.DICOM_SOURCE: [
+                str(dicom_path.FromPath(path, instance_uid='1.42'))
+            ],
+        },
+        _DEBUG_SETTINGS,
         [],
     )
     store_path = str(path.GetStorePath())
@@ -103,7 +111,9 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_get_dicom_patches_dicom_slide_not_found(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
     path = dicom_path.FromString(
         '/projects/project/locations/location/datasets/dataset/dicomStores/dicomstore/dicomWeb/studies/1.42/series/1.42'
@@ -115,12 +125,15 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
             default_height=_DEBUG_SETTINGS.endpoint_input_height,
         )
     ]
-    instance = data_accessor_definition.DicomWSIImage(
+    instance = data_accessor_definition.json_to_dicom_wsi_image(
         credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-        str(path),
-        {},
-        '1.42',
-        coordinates,
+        {
+            _InstanceJsonKeys.PATCH_COORDINATES: [
+                dataclasses.asdict(c) for c in coordinates
+            ],
+            _InstanceJsonKeys.DICOM_SOURCE: [str(path)],
+        },
+        _DEBUG_SETTINGS,
         [],
     )
     store_path = str(path.GetStorePath())
@@ -133,8 +146,7 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
             ).data_iterator()
         )
 
-  @parameterized.parameters(['https://bad_path', '', 'bad_path'])
-  def test_get_dicom_patches_bad_path(self, bad_path):
+  def test_get_dicom_patches_bad_path(self):
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -144,9 +156,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     ]
     instance = data_accessor_definition.DicomWSIImage(
         credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-        bad_path,
+        [dicom_path.FromString('https://bad_path')],
         {},
-        '1.42',
         coordinates,
         [],
     )
@@ -160,9 +171,11 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
   @parameterized.parameters(['', 'mock_bearer_token'])
   def test_get_dicom_patches(self, bearer_token):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -172,9 +185,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     ]
     instance = data_accessor_definition.DicomWSIImage(
         credential_factory.TokenPassthroughCredentialFactory(bearer_token),
-        str(path),
+        [path],
         {},
-        dcm.SOPInstanceUID,
         coordinates,
         [],
     )
@@ -194,15 +206,16 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
   @parameterized.parameters(['', 'mock_bearer_token'])
   def test_get_dicom_whole_slide(self, bearer_token):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = []
     instance = data_accessor_definition.DicomWSIImage(
         credential_factory.TokenPassthroughCredentialFactory(bearer_token),
-        str(path),
+        [path],
         {},
-        dcm.SOPInstanceUID,
         coordinates,
         [],
     )
@@ -236,9 +249,11 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       self, create_transform, extension
   ):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -250,9 +265,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
         credential_factory.TokenPassthroughCredentialFactory(
             'mock_bearer_token'
         ),
-        str(path),
+        [path],
         extension,
-        dcm.SOPInstanceUID,
         coordinates,
         [],
     )
@@ -271,10 +285,10 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     create_transform.assert_not_called()
 
   def test_get_dicom_patches_no_pixel_spacing(self):
-    dcm = pydicom.dcmread(test_files.testdata_path('test.dcm'))
+    dcm = pydicom.dcmread(test_utils.testdata_path('wsi', 'test.dcm'))
     # remove pixel spacing
     del dcm['SharedFunctionalGroupsSequence']  # pylint: disable=invalid-delete
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -286,9 +300,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
         credential_factory.TokenPassthroughCredentialFactory(
             'mock_bearer_token'
         ),
-        str(path),
+        [path],
         {_InstanceJsonKeys.REQUIRE_PATCHES_FULLY_IN_SOURCE_IMAGE: False},
-        dcm.SOPInstanceUID,
         coordinates,
         [],
     )
@@ -316,12 +329,12 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       ),
   ])
   def test_get_dicom_patches_from_non_tiled_dicom(self, sop_class_uid):
-    dcm = pydicom.dcmread(test_files.testdata_path('test.dcm'))
+    dcm = pydicom.dcmread(test_utils.testdata_path('wsi', 'test.dcm'))
     # remove pixel spacing
     del dcm['SharedFunctionalGroupsSequence']  # pylint: disable=invalid-delete
     dcm.file_meta.MediaStorageSOPClassUID = sop_class_uid
     dcm.SOPClassUID = sop_class_uid
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -333,9 +346,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
         credential_factory.TokenPassthroughCredentialFactory(
             'mock_bearer_token'
         ),
-        str(path),
+        [path],
         {_InstanceJsonKeys.REQUIRE_PATCHES_FULLY_IN_SOURCE_IMAGE: False},
-        dcm.SOPInstanceUID,
         coordinates,
         [],
     )
@@ -354,10 +366,12 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_get_dicom_patches_from_sparse_dicom_raises(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
     del dcm['00209311']  # pylint: disable=invalid-delete
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -367,9 +381,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     ]
     instance = data_accessor_definition.DicomWSIImage(
         credential_factory.TokenPassthroughCredentialFactory('bearer_token'),
-        str(path),
+        [path],
         {},
-        dcm.SOPInstanceUID,
         coordinates,
         [],
     )
@@ -387,9 +400,11 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       self,
   ):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -399,9 +414,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     ]
     instance = data_accessor_definition.DicomWSIImage(
         credential_factory.TokenPassthroughCredentialFactory('bearer_token'),
-        str(path),
+        [dicom_path.FromPath(path, instance_uid='1.42')],
         {},
-        '1.42',
         coordinates,
         [],
     )
@@ -418,9 +432,11 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
   @parameterized.parameters('mock_bearer_token', '')
   def test_repeated_get_dicom_patches_does_not_re_int(self, bearer_token):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -430,9 +446,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     ]
     instance = data_accessor_definition.DicomWSIImage(
         credential_factory.TokenPassthroughCredentialFactory(bearer_token),
-        str(path),
+        [path],
         {},
-        dcm.SOPInstanceUID,
         coordinates,
         [],
     )
@@ -475,14 +490,18 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_get_dicom_instances_with_different_transfer_syntax_raise(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
     # define two concatenation instances with different transfer syntaxs.
     dcm.InConcatenationNumber = 1
     dcm.ConcatenationUID = '1.43'
     dcm.ConcatenationFrameOffsetNumber = 0
     dcm2 = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
     dcm2.file_meta.MediaStorageSOPInstanceUID = '1.42'
     dcm2.ConcatenationFrameOffsetNumber = dcm.NumberOfFrames
@@ -490,7 +509,7 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     dcm2.InConcatenationNumber = 2
     dcm2.ConcatenationUID = '1.43'
     dcm2.file_meta.TransferSyntaxUID = '1.2.840.10008.1.​2.​1'
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -500,9 +519,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     ]
     instance = data_accessor_definition.DicomWSIImage(
         credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-        str(path),
+        [path],
         {},
-        dcm.SOPInstanceUID,
         coordinates,
         [],
     )
@@ -523,10 +541,12 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_get_dicom_instances_invalid_tags_raises(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
     del dcm['00080008']  # pylint: disable=invalid-delete
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -536,9 +556,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     ]
     instance = data_accessor_definition.DicomWSIImage(
         credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-        str(path),
+        [path],
         {},
-        dcm.SOPInstanceUID,
         coordinates,
         [],
     )
@@ -557,9 +576,11 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_can_not_find_dicom_level_raises(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -584,9 +605,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       # modifying metadata to remove instance.
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           {_InstanceJsonKeys.EZ_WSI_STATE: metadata},
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -599,9 +619,11 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_dicom_level_resize_greater_than_8x_raises(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {_InstanceJsonKeys.X_ORIGIN: 0, _InstanceJsonKeys.Y_ORIGIN: 0},
@@ -614,7 +636,7 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       mk_dicom_stores[store_path].add_instance(dcm)
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           {
               _InstanceJsonKeys.IMAGE_DIMENSIONS: dataclasses.asdict(
                   image_dimension_utils.ImageDimensions(
@@ -623,7 +645,6 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
                   )
               )
           },
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -639,9 +660,11 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_dicom_level_resize(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -654,7 +677,7 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       mk_dicom_stores[store_path].add_instance(dcm)
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           {
               _InstanceJsonKeys.IMAGE_DIMENSIONS: dataclasses.asdict(
                   image_dimension_utils.ImageDimensions(
@@ -663,7 +686,6 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
                   )
               )
           },
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -681,9 +703,11 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_dicom_patch_outside_level_dim(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -696,7 +720,7 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       mk_dicom_stores[store_path].add_instance(dcm)
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           {
               _InstanceJsonKeys.IMAGE_DIMENSIONS: dataclasses.asdict(
                   image_dimension_utils.ImageDimensions(
@@ -705,7 +729,6 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
                   )
               )
           },
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -722,10 +745,12 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_dicom_bits_allocated_not_8_raises(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
     dcm.BitsAllocated = 12
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -738,9 +763,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       mk_dicom_stores[store_path].add_instance(dcm)
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           {},
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -756,10 +780,12 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_dicom_icc_profile_correction_changes_pixel_values(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
     dcm.ICCProfile = dicom_slide.get_rommrgb_icc_profile_bytes()
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -772,9 +798,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       mk_dicom_stores[store_path].add_instance(dcm)
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           {_InstanceJsonKeys.TRANSFORM_IMAGING_TO_ICC_PROFILE: 'SRGB'},
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -785,9 +810,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       )
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           {_InstanceJsonKeys.TRANSFORM_IMAGING_TO_ICC_PROFILE: 'ROMMRGB'},
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -803,10 +827,12 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
 
   def test_dicom_icc_profile_no_effect_of_correction_for_same_profile(self):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
     dcm.ICCProfile = dicom_slide.get_rommrgb_icc_profile_bytes()
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -819,9 +845,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       mk_dicom_stores[store_path].add_instance(dcm)
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           {},
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -832,9 +857,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       )
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           {_InstanceJsonKeys.TRANSFORM_IMAGING_TO_ICC_PROFILE: 'ROMMRGB'},
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -860,10 +884,12 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
   @mock.patch.object(icc_profile_cache, 'get_dicom_icc_profile', autospec=True)
   def test_dicom_icc_profile_not_called(self, mock_get_profile, exensions):
     dcm = pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     )
     dcm.ICCProfile = dicom_slide.get_rommrgb_icc_profile_bytes()
-    path = _dicom_series_path(dcm)
+    path = _dicom_instance_path(dcm)
     coordinates = [
         patch_coordinate.create_patch_coordinate(
             {'x_origin': 0, 'y_origin': 0},
@@ -876,9 +902,8 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       mk_dicom_stores[store_path].add_instance(dcm)
       instance = data_accessor_definition.DicomWSIImage(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
+          [path],
           exensions,
-          dcm.SOPInstanceUID,
           coordinates,
           [],
       )
@@ -936,23 +961,28 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
     )
 
   def test_is_accessor_data_embedded_in_request(self):
+    coordinates = [
+        patch_coordinate.create_patch_coordinate(
+            {'x_origin': 0, 'y_origin': 0},
+            default_width=_DEBUG_SETTINGS.endpoint_input_width,
+            default_height=_DEBUG_SETTINGS.endpoint_input_height,
+        )
+    ]
     with pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     ) as dcm:
-      path = _dicom_series_path(dcm)
-      coordinates = [
-          patch_coordinate.create_patch_coordinate(
-              {'x_origin': 0, 'y_origin': 0},
-              default_width=_DEBUG_SETTINGS.endpoint_input_width,
-              default_height=_DEBUG_SETTINGS.endpoint_input_height,
-          )
-      ]
-      instance = data_accessor_definition.DicomWSIImage(
+      path = _dicom_instance_path(dcm)
+      instance = data_accessor_definition.json_to_dicom_wsi_image(
           credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
-          {},
-          dcm.SOPInstanceUID,
-          coordinates,
+          {
+              _InstanceJsonKeys.PATCH_COORDINATES: [
+                  dataclasses.asdict(c) for c in coordinates
+              ],
+              _InstanceJsonKeys.DICOM_SOURCE: str(path),
+          },
+          _DEBUG_SETTINGS,
           [],
       )
       self.assertFalse(
@@ -997,20 +1027,419 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
   )
   def test_accessor_length(self, coordinates, expected):
     with pydicom.dcmread(
-        test_files.testdata_path('multiframe_camelyon_challenge_image.dcm')
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
     ) as dcm:
-      path = _dicom_series_path(dcm)
-      instance = data_accessor_definition.DicomWSIImage(
-          credential_factory.TokenPassthroughCredentialFactory('mock_token'),
-          str(path),
-          {},
-          dcm.SOPInstanceUID,
-          coordinates,
+      path = _dicom_instance_path(dcm)
+      store_path = str(path.GetStorePath())
+      with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+        mk_dicom_stores[store_path].add_instance(dcm)
+        instance = data_accessor_definition.json_to_dicom_wsi_image(
+            credential_factory.NoAuthCredentialsFactory(),
+            {
+                _InstanceJsonKeys.PATCH_COORDINATES: [
+                    dataclasses.asdict(c) for c in coordinates
+                ],
+                _InstanceJsonKeys.DICOM_WEB_URI: str(path),
+            },
+            _DEBUG_SETTINGS,
+            [],
+        )
+        self.assertLen(
+            data_accessor.DicomDigitalPathologyData(instance, _DEBUG_SETTINGS),
+            expected,
+        )
+
+  def test_parse_json_invalid_extensions_raises(self):
+    with self.assertRaises(data_accessor_errors.InvalidRequestFieldError):
+      data_accessor_definition.json_to_dicom_wsi_image(
+          credential_factory.NoAuthCredentialsFactory(),
+          {
+              _InstanceJsonKeys.EXTENSIONS: {1: 1},
+              _InstanceJsonKeys.DICOM_WEB_URI: (
+                  'http://localhost:12345/studies/1.2.3/series/4.5.6/instances/7.8.9'
+              ),
+          },
+          _DEBUG_SETTINGS,
           [],
       )
+
+  def test_dicom_series_defines_wsi_and_microscope_image_raises(self):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    with pydicom.dcmread(
+        test_utils.testdata_path(
+            'wsi', 'multiframe_camelyon_challenge_image.dcm'
+        )
+    ) as dcm:
+      path = _dicom_instance_path(dcm).GetSeriesPath()
+      store_path = str(path.GetStorePath())
+      study_uid = dcm.StudyInstanceUID
+      series_uid = dcm.SeriesInstanceUID
+    with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+      for dcm_path in (
+          test_utils.testdata_path(
+              'wsi', 'multiframe_camelyon_challenge_image.dcm'
+          ),
+          test_utils.testdata_path(
+              'slide_coordinates_microscopic_image',
+              'test_slide_coordinates.dcm',
+          ),
+      ):
+        with pydicom.dcmread(dcm_path) as dcm:
+          dcm.StudyInstanceUID = study_uid
+          dcm.SeriesInstanceUID = series_uid
+          mk_dicom_stores[store_path].add_instance(dcm)
+      instance = data_accessor_definition.json_to_dicom_wsi_image(
+          cf,
+          {_InstanceJsonKeys.DICOM_WEB_URI: str(path)},
+          _DEBUG_SETTINGS,
+          dicom_web_interface.DicomWebInterface(cf).get_instances(path),
+      )
+      with self.assertRaisesRegex(
+          data_accessor_errors.DicomError,
+          'Cannot return for DICOM images for  VL_Whole_Slide_Microscopy_Images'
+          ' and DICOM Microscopic_Images in the same request.*',
+      ):
+        list(
+            data_accessor.DicomDigitalPathologyData(
+                instance, _DEBUG_SETTINGS
+            ).data_iterator()
+        )
+
+  @parameterized.parameters([1, 2, 3])
+  def test_dicom_series_with_microscope_images_returns_expected_number_of_images(
+      self, expected
+  ):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'slide_coordinates_microscopic_image',
+        'test_slide_coordinates.dcm',
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      path = _dicom_instance_path(dcm).GetSeriesPath()
+      store_path = str(path.GetStorePath())
+    with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+      for index in range(expected):
+        with pydicom.dcmread(dcm_path) as dcm:
+          dcm.SOPInstanceUID = f'1.3.4.5{index}'
+          mk_dicom_stores[store_path].add_instance(dcm)
+      instance = data_accessor_definition.json_to_dicom_wsi_image(
+          cf,
+          {_InstanceJsonKeys.DICOM_WEB_URI: str(path)},
+          _DEBUG_SETTINGS,
+          dicom_web_interface.DicomWebInterface(cf).get_instances(path),
+      )
       self.assertLen(
-          data_accessor.DicomDigitalPathologyData(instance, _DEBUG_SETTINGS),
+          list(
+              data_accessor.DicomDigitalPathologyData(
+                  instance, _DEBUG_SETTINGS
+              ).data_iterator()
+          ),
           expected,
+      )
+
+  @parameterized.parameters([1, 2, 3])
+  def test_preload_microscope_images_returns_expected_number_of_images(
+      self, expected
+  ):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'slide_coordinates_microscopic_image',
+        'test_slide_coordinates.dcm',
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      path = _dicom_instance_path(dcm).GetSeriesPath()
+      store_path = str(path.GetStorePath())
+    with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+      for index in range(expected):
+        with pydicom.dcmread(dcm_path) as dcm:
+          dcm.SOPInstanceUID = f'1.3.4.5{index}'
+          mk_dicom_stores[store_path].add_instance(dcm)
+      instance = data_accessor_definition.json_to_dicom_wsi_image(
+          cf,
+          {_InstanceJsonKeys.DICOM_WEB_URI: str(path)},
+          _DEBUG_SETTINGS,
+          dicom_web_interface.DicomWebInterface(cf).get_instances(path),
+      )
+      da = data_accessor.DicomDigitalPathologyData(instance, _DEBUG_SETTINGS)
+      with contextlib.ExitStack() as stack:
+        da.load_data(stack)
+        self.assertLen(list(da.data_iterator()), expected)
+
+  def test_dicom_series_with_wsi_returns_one_number_of_image(self):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'wsi', 'multiframe_camelyon_challenge_image.dcm'
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      path = _dicom_instance_path(dcm).GetSeriesPath()
+      store_path = str(path.GetStorePath())
+      with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+        mk_dicom_stores[store_path].add_instance(dcm)
+        instance = data_accessor_definition.json_to_dicom_wsi_image(
+            cf,
+            {_InstanceJsonKeys.DICOM_WEB_URI: str(path)},
+            _DEBUG_SETTINGS,
+            dicom_web_interface.DicomWebInterface(cf).get_instances(path),
+        )
+        self.assertLen(
+            list(
+                data_accessor.DicomDigitalPathologyData(
+                    instance, _DEBUG_SETTINGS
+                ).data_iterator()
+            ),
+            1,
+        )
+
+  def test_dicom_series_with_wsi_thumbnail_returns_one_number_of_image(self):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'wsi', 'multiframe_camelyon_challenge_image.dcm'
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      path = _dicom_instance_path(dcm).GetSeriesPath()
+      store_path = str(path.GetStorePath())
+      with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+        dcm.NumberOfFrames = 1
+        dcm.ImageType = ['THUMBNAIL']
+        mk_dicom_stores[store_path].add_instance(dcm)
+        instance = data_accessor_definition.json_to_dicom_wsi_image(
+            cf,
+            {_InstanceJsonKeys.DICOM_WEB_URI: str(path)},
+            _DEBUG_SETTINGS,
+            dicom_web_interface.DicomWebInterface(cf).get_instances(path),
+        )
+        self.assertLen(
+            list(
+                data_accessor.DicomDigitalPathologyData(
+                    instance, _DEBUG_SETTINGS
+                ).data_iterator()
+            ),
+            1,
+        )
+
+  @parameterized.parameters(['LABEL', 'OVERVIEW'])
+  def test_dicom_series_with_only_invalid_wsi_instances_raises(
+      self, image_type_str
+  ):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'wsi', 'multiframe_camelyon_challenge_image.dcm'
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      path = _dicom_instance_path(dcm).GetSeriesPath()
+      store_path = str(path.GetStorePath())
+      with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+        dcm.NumberOfFrames = 1
+        dcm.ImageType = [image_type_str]
+        mk_dicom_stores[store_path].add_instance(dcm)
+        instance = data_accessor_definition.json_to_dicom_wsi_image(
+            cf,
+            {_InstanceJsonKeys.DICOM_WEB_URI: str(path)},
+            _DEBUG_SETTINGS,
+            dicom_web_interface.DicomWebInterface(cf).get_instances(path),
+        )
+        with self.assertRaisesRegex(
+            data_accessor_errors.LevelNotFoundError,
+            '.* is missing WSI pyramid and WSI thumbnail image.*',
+        ):
+          list(
+              data_accessor.DicomDigitalPathologyData(
+                  instance, _DEBUG_SETTINGS
+              ).data_iterator()
+          )
+
+  def test_dicom_contains_invalid_metadata_raises(self):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'wsi', 'multiframe_camelyon_challenge_image.dcm'
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      path = _dicom_instance_path(dcm).GetSeriesPath()
+      store_path = str(path.GetStorePath())
+      with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+        dcm.NumberOfFrames = 1
+        dcm.ConcatenationFrameOffsetNumber = 2
+        dcm.ImageType = ['THUMBNAIL']
+        mk_dicom_stores[store_path].add_instance(dcm)
+        instance = data_accessor_definition.json_to_dicom_wsi_image(
+            cf,
+            {_InstanceJsonKeys.DICOM_WEB_URI: str(path)},
+            _DEBUG_SETTINGS,
+            dicom_web_interface.DicomWebInterface(cf).get_instances(path),
+        )
+        with self.assertRaisesRegex(
+            data_accessor_errors.DicomError,
+            '.*DICOM metadata error.*',
+        ):
+          list(
+              data_accessor.DicomDigitalPathologyData(
+                  instance, _DEBUG_SETTINGS
+              ).data_iterator()
+          )
+
+  def test_dicom_request_contains_invalid_ez_wsi_state_raises(self):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'wsi', 'multiframe_camelyon_challenge_image.dcm'
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      path = _dicom_instance_path(dcm).GetSeriesPath()
+      store_path = str(path.GetStorePath())
+      with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+        mk_dicom_stores[store_path].add_instance(dcm)
+        instance = data_accessor_definition.json_to_dicom_wsi_image(
+            cf,
+            {
+                _InstanceJsonKeys.EXTENSIONS: {
+                    _InstanceJsonKeys.EZ_WSI_STATE: {'1.2.3': {}}
+                },
+                _InstanceJsonKeys.DICOM_WEB_URI: str(path),
+            },
+            _DEBUG_SETTINGS,
+            dicom_web_interface.DicomWebInterface(cf).get_instances(path),
+        )
+        with self.assertRaisesRegex(
+            data_accessor_errors.EzWsiStateError,
+            '.*Error decoding embedding request JSON metadata.*',
+        ):
+          list(
+              data_accessor.DicomDigitalPathologyData(
+                  instance, _DEBUG_SETTINGS
+              ).data_iterator()
+          )
+
+  def test_dicom_request_from_two_concatenated_instances_returns_one_image(
+      self,
+  ):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'wsi', 'multiframe_camelyon_challenge_image.dcm'
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      instance_path = _dicom_instance_path(dcm)
+      series_path = instance_path.GetSeriesPath()
+      store_path = str(instance_path.GetStorePath())
+    with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+      with pydicom.dcmread(dcm_path) as dcm:
+        dcm.ConcatenationUID = '1.2'
+        dcm.InConcatenationNumber = 1
+        dcm.InConcatenationTotalNumber = 2
+        dcm.NumberOfFrames = dcm.NumberOfFrames // 2
+        dcm.ConcatenationFrameOffsetNumber = 0
+        mk_dicom_stores[store_path].add_instance(dcm)
+        path_1 = _dicom_instance_path(dcm)
+      with pydicom.dcmread(dcm_path) as dcm:
+        dcm.SOPInstanceUID = '1.2.3.4.5'
+        dcm.ConcatenationUID = '1.2'
+        dcm.InConcatenationNumber = 2
+        dcm.InConcatenationTotalNumber = 2
+        dcm.ConcatenationFrameOffsetNumber = dcm.NumberOfFrames // 2
+        dcm.NumberOfFrames = dcm.NumberOfFrames - (dcm.NumberOfFrames // 2)
+        mk_dicom_stores[store_path].add_instance(dcm)
+        path_2 = _dicom_instance_path(dcm)
+      instance = data_accessor_definition.json_to_dicom_wsi_image(
+          cf,
+          {
+              _InstanceJsonKeys.DICOM_SOURCE: [str(path_1), str(path_2)],
+          },
+          _DEBUG_SETTINGS,
+          dicom_web_interface.DicomWebInterface(cf).get_instances(series_path),
+      )
+      self.assertLen(
+          list(
+              data_accessor.DicomDigitalPathologyData(
+                  instance, _DEBUG_SETTINGS
+              ).data_iterator()
+          ),
+          1,
+      )
+
+  def test_dicom_request_from_single_concatenated_instances_returns_one_image(
+      self,
+  ):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'wsi', 'multiframe_camelyon_challenge_image.dcm'
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      instance_path = _dicom_instance_path(dcm)
+      series_path = instance_path.GetSeriesPath()
+      store_path = str(instance_path.GetStorePath())
+    with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+      with pydicom.dcmread(dcm_path) as dcm:
+        dcm.ConcatenationUID = '1.2'
+        dcm.InConcatenationNumber = 1
+        dcm.InConcatenationTotalNumber = 2
+        dcm.NumberOfFrames = dcm.NumberOfFrames // 2
+        dcm.ConcatenationFrameOffsetNumber = 0
+        mk_dicom_stores[store_path].add_instance(dcm)
+        path_1 = _dicom_instance_path(dcm)
+      with pydicom.dcmread(dcm_path) as dcm:
+        dcm.SOPInstanceUID = '1.2.3.4.5'
+        dcm.ConcatenationUID = '1.2'
+        dcm.InConcatenationNumber = 2
+        dcm.InConcatenationTotalNumber = 2
+        dcm.ConcatenationFrameOffsetNumber = dcm.NumberOfFrames // 2
+        dcm.NumberOfFrames = dcm.NumberOfFrames - (dcm.NumberOfFrames // 2)
+        mk_dicom_stores[store_path].add_instance(dcm)
+      instance = data_accessor_definition.json_to_dicom_wsi_image(
+          cf,
+          {
+              _InstanceJsonKeys.DICOM_SOURCE: [str(path_1)],
+          },
+          _DEBUG_SETTINGS,
+          dicom_web_interface.DicomWebInterface(cf).get_instances(series_path),
+      )
+      self.assertLen(
+          list(
+              data_accessor.DicomDigitalPathologyData(
+                  instance, _DEBUG_SETTINGS
+              ).data_iterator()
+          ),
+          1,
+      )
+
+  @parameterized.parameters([0, 1, 2])
+  def test_dicom_request_from_two_pyramids_levels_returns_two_images(
+      self, max_parallel_download_workers
+  ):
+    cf = credential_factory.NoAuthCredentialsFactory()
+    dcm_path = test_utils.testdata_path(
+        'wsi', 'multiframe_camelyon_challenge_image.dcm'
+    )
+    with pydicom.dcmread(dcm_path) as dcm:
+      instance_path = _dicom_instance_path(dcm)
+      series_path = instance_path.GetSeriesPath()
+      store_path = str(instance_path.GetStorePath())
+    with dicom_store_mock.MockDicomStores(store_path) as mk_dicom_stores:
+      with pydicom.dcmread(dcm_path) as dcm:
+        mk_dicom_stores[store_path].add_instance(dcm)
+        path_1 = _dicom_instance_path(dcm)
+      with pydicom.dcmread(dcm_path) as dcm:
+        dcm.SOPInstanceUID = '1.2.3.4.5'
+        mk_dicom_stores[store_path].add_instance(dcm)
+        path_2 = _dicom_instance_path(dcm)
+      settings = dataclasses.replace(
+          _DEBUG_SETTINGS,
+          max_parallel_download_workers=max_parallel_download_workers,
+      )
+      instance = data_accessor_definition.json_to_dicom_wsi_image(
+          cf,
+          {
+              _InstanceJsonKeys.DICOM_SOURCE: [str(path_1), str(path_2)],
+          },
+          settings,
+          dicom_web_interface.DicomWebInterface(cf).get_instances(series_path),
+      )
+      self.assertLen(
+          list(
+              data_accessor.DicomDigitalPathologyData(
+                  instance, settings
+              ).data_iterator()
+          ),
+          2,
       )
 
 

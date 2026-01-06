@@ -15,8 +15,11 @@
 
 from __future__ import annotations
 
+from concurrent import futures
 import contextlib
+import copy
 import dataclasses
+import functools
 import time
 import typing
 from typing import Any, Iterator, Mapping, Optional, Sequence, Union
@@ -46,6 +49,11 @@ from serving.logging_lib import cloud_logging_client
 
 _InstanceJsonKeys = data_accessor_const.InstanceJsonKeys
 _MAX_DICOM_LEVEL_DOWNSAMPLE = 8.0
+
+_SERIES_OR_INSTANCE_DICOM_PATH_TYPES = (
+    dicom_path.Type.SERIES,
+    dicom_path.Type.INSTANCE,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -165,122 +173,20 @@ def _pre_load_slide_patches(
     ds.preload_patches_in_frame_cache(patches, blocking=blocking)
 
 
-def _load_slide_data(
+def _load_slide_level(
     instance: data_accessor_definition.DicomWSIImage,
     settings: configuration.ConfigurationSettings,
+    require_fully_in_source_image: bool,
+    resize_level_dim: Optional[image_dimension_utils.ImageDimensions],
+    target_icc_profile: Optional[ImageCms.core.CmsProfile],
+    series_path_ds_level: tuple[
+        dicom_path.Path,
+        Union[dicom_slide.DicomSlide, dicom_slide.DicomMicroscopeImage],
+        dicom_slide.Level,
+    ],
 ) -> _LocalData:
-  """Loads slide data for DICOM WSI into local memory."""
-  cloud_logging_client.info('Generating embedding from DICOM.')
-  require_fully_in_source_image = (
-      patch_coordinate_module.patch_required_to_be_fully_in_source_image(
-          instance.extensions
-      )
-  )
-  resize_level_dim = image_dimension_utils.get_resize_image_dimensions(
-      instance.extensions
-  )
-  ez_wsi_state = _get_ez_wsi_state(instance.extensions)
-  target_icc_profile = icc_profile_utils.get_target_icc_profile(
-      instance.extensions
-  )
-  dwi = dicom_web_interface.DicomWebInterface(instance.credential_factory)
-
-  try:
-    path = dicom_path.FromPath(
-        dicom_path.FromString(instance.series_path),
-        instance_uid='',
-    )
-  except ValueError as exp:
-    msg = f'DICOM path is invalid: {instance.series_path}.'
-    cloud_logging_client.info(
-        msg,
-        {'slide_path_requested': instance.series_path},
-        exp,
-    )
-    raise data_accessor_errors.DicomPathError(msg) from exp
-  if not path.series_uid or not path.study_uid:
-    msg = f'DICOM path is invalid: {instance.series_path}.'
-    cloud_logging_client.info(
-        msg, {'slide_path_requested': instance.series_path}
-    )
-    raise data_accessor_errors.DicomPathError(
-        f'Slide path is invalid: {instance.series_path}.'
-    )
-  # Load DICOM Slide only if slide path changes. Avoid unneeded
-  # state requests and optionally init pyramid level metadata from
-  # parameter to avoid DICOM store slide metadata query.
-  _validate_dicom_image_accessor(str(path), settings)
-  try:
-    start_time = time.time()
-    series_images = dicom_slide.DicomMicroscopeSeries(
-        dwi=dwi,
-        path=path,
-        enable_client_slide_frame_decompression=True,
-        json_metadata=ez_wsi_state,
-        instance_uids=[instance.instance_uid],
-        logging_factory=ez_wsi_cloud_logging_adapter.EZWSILoggingInterfaceFactory(
-            cloud_logging_client.get_log_signature()
-        ),
-        dicom_instances_metadata=instance.dicom_instances_metadata,
-    )
-    if series_images.dicom_slide is not None:
-      if series_images.dicom_microscope_image is not None:
-        msg = (
-            'Cannot return embeddings for DICOM'
-            ' VL_Whole_Slide_Microscopy_Images and DICOM Microscopic_Images'
-            ' in the same instance request; split patch request across'
-            ' multiple instances.'
-        )
-        cloud_logging_client.info(msg)
-        raise data_accessor_errors.DicomError(msg)
-      ds = series_images.dicom_slide
-    elif series_images.dicom_microscope_image is not None:
-      ds = series_images.dicom_microscope_image
-    else:
-      msg = f'Could not find DICOM imaging; path: {path}.'
-      cloud_logging_client.info(msg)
-      raise data_accessor_errors.DicomPathError(msg)
-  except ez_wsi_errors.DicomSlideInitError as exp:
-    msg = f'DICOM metadata error; Path: {path}; {exp}'
-    cloud_logging_client.info(msg, exp)
-    raise data_accessor_errors.DicomError(msg) from exp
-  except (
-      ez_wsi_errors.SlideLevelContainsInstancesWithDifferentTransferSyntaxUIDError
-  ) as exp:
-    msg = (
-        'All DICOM instances in a pyramid level are required to have same'
-        ' TransferSyntaxUID.'
-    )
-    cloud_logging_client.info(msg, exp)
-    raise data_accessor_errors.DicomError(msg) from exp
-  except (
-      ez_wsi_errors.DicomTagNotFoundError,
-      ez_wsi_errors.InvalidDicomTagError,
-  ) as exp:
-    msg = f'DICOM instance missing required tags; Path: {path}; {exp}'
-    cloud_logging_client.info(msg, exp)
-    raise data_accessor_errors.DicomError(msg) from exp
-  except ez_wsi_errors.UnexpectedDicomObjectInstanceError as exp:
-    msg = 'DICOM metadata lacks SOP Instance UID.'
-    cloud_logging_client.info(msg, exp)
-    raise data_accessor_errors.DicomError(msg) from exp
-  except (
-      ez_wsi_errors.InvalidSlideJsonMetadataError,
-      ez_wsi_errors.SlidePathDoesNotMatchJsonMetadataError,
-  ) as exp:
-    msg = 'Error decoding embedding request JSON metadata.'
-    cloud_logging_client.error(
-        msg,
-        {'slide_path_requested': path},
-        exp,
-    )
-    # If this occurs it would be a bug in the ez-wsi interface.
-    raise data_accessor_errors.EzWsiStateError(msg) from exp
-  cloud_logging_client.info(
-      f'Retrieved metadata for slide: {path};'
-      f' {time.time() - start_time} (sec).',
-      {'slide_path_requested': path},
-  )
+  """Loads slide level imaging."""
+  series_path, ds, level = series_path_ds_level
   # Initialize in-memory cache on slide to store frames requested in batch.
   # Optimization hints = MINIMIZE_LATENCY or MINIMIZE_DICOM_STORE_QPM
   # MINIMIZE_LATENCY: Batch load frames async. If a frame is
@@ -292,14 +198,6 @@ def _load_slide_data(
   ds.init_slide_frame_cache(
       optimization_hint=local_dicom_slide_cache_types.CacheConfigOptimizationHint.MINIMIZE_DICOM_STORE_QPM
   )
-  level = ds.get_instance_level(instance.instance_uid)
-  if level is None:
-    msg = (
-        f'{instance.instance_uid} is not part of DICOM WSI pyramid; path:'
-        f' {path}.'
-    )
-    cloud_logging_client.info(msg)
-    raise data_accessor_errors.LevelNotFoundError(msg)
   if level.pixel_spacing.is_defined:
     level_pixel_spacing = (
         f'{level.pixel_spacing.column_spacing_mm},'
@@ -323,8 +221,8 @@ def _load_slide_data(
           'frame_number_min': level.frame_number_min,
           'frame_number_max': level.frame_number_max,
           'transfer_syntax_uid': level.transfer_syntax_uid,
-          'study_instance_uid': path.study_uid,
-          'series_instance_uid': path.series_uid,
+          'study_instance_uid': series_path.study_uid,
+          'series_instance_uid': series_path.series_uid,
           'sop_instance_uids': level.get_level_sop_instance_uids(),
           _InstanceJsonKeys.REQUIRE_PATCHES_FULLY_IN_SOURCE_IMAGE: (
               require_fully_in_source_image
@@ -377,15 +275,16 @@ def _load_slide_data(
         ) from exp
       except ez_wsi_errors.DicomPatchGenerationError as exp:
         msg = (
-            'Can not generate patches from DICOM instances with more than one'
-            ' frame and Dimension Organization Type != TILED_FULL.'
+            'Can not generate patches from DICOM instances with more than'
+            ' one frame and Dimension Organization Type != TILED_FULL.'
         )
         cloud_logging_client.info(msg, exp)
         raise data_accessor_errors.DicomTiledFullError(msg) from exp
     # Pre-fetch only the frames required for inference into the EZ-WSI frame
     # cache.
     fc = typing.cast(
-        local_dicom_slide_cache.InMemoryDicomSlideCache, ds.slide_frame_cache
+        local_dicom_slide_cache.InMemoryDicomSlideCache,
+        ds.slide_frame_cache,
     )
     fc.reset_cache_stats()
     load_whole_slide_frame_ratio = _get_load_whole_slide_frame_ratio(
@@ -415,8 +314,8 @@ def _load_slide_data(
       ) as exp:
         msg = (
             'Failed to retrieve ICC profile from DICOM store. Invalid DICOM'
-            f' store credentials; HTTP status code: {exp.status_code}; reason:'
-            f' {exp.reason}.'
+            f' store credentials; HTTP status code: {exp.status_code};'
+            f' reason: {exp.reason}.'
         )
         cloud_logging_client.info(msg, exp)
         raise data_accessor_errors.InvalidCredentialsError(msg) from exp
@@ -499,6 +398,210 @@ def _load_slide_data(
     raise data_accessor_errors.DicomError(msg) from exp
 
 
+def _load_slide_data(
+    instance: data_accessor_definition.DicomWSIImage,
+    settings: configuration.ConfigurationSettings,
+) -> Sequence[_LocalData]:
+  """Loads slide data for DICOM WSI into local memory."""
+  cloud_logging_client.info('Generating embedding from DICOM.')
+  require_fully_in_source_image = (
+      patch_coordinate_module.patch_required_to_be_fully_in_source_image(
+          instance.extensions
+      )
+  )
+  resize_level_dim = image_dimension_utils.get_resize_image_dimensions(
+      instance.extensions
+  )
+  ez_wsi_state = _get_ez_wsi_state(instance.extensions)
+  target_icc_profile = icc_profile_utils.get_target_icc_profile(
+      instance.extensions
+  )
+  dwi = dicom_web_interface.DicomWebInterface(instance.credential_factory)
+  ds_and_series_path_and_level_data_to_load = []
+  last_sop_instance_defined_level = None
+  for dicomweb_path in instance.dicomweb_paths:
+    if dicomweb_path.type not in _SERIES_OR_INSTANCE_DICOM_PATH_TYPES:
+      msg = f'DICOM path is invalid: {dicomweb_path}.'
+      cloud_logging_client.info(msg, {'slide_path_requested': dicomweb_path})
+      raise data_accessor_errors.DicomPathError(
+          f'Slide path is invalid: {dicomweb_path}.'
+      )
+    series_path = dicomweb_path.GetSeriesPath()
+    if dicomweb_path.type == dicom_path.Type.INSTANCE:
+      sop_instance_uid = dicomweb_path.instance_uid
+    else:
+      sop_instance_uid = None
+    _validate_dicom_image_accessor(str(series_path), settings)
+    start_time = time.time()
+    try:
+      series_images = dicom_slide.DicomMicroscopeSeries(
+          dwi=dwi,
+          path=series_path,
+          enable_client_slide_frame_decompression=True,
+          json_metadata=ez_wsi_state,
+          instance_uids=None
+          if sop_instance_uid is None
+          else [sop_instance_uid],
+          logging_factory=ez_wsi_cloud_logging_adapter.EZWSILoggingInterfaceFactory(
+              cloud_logging_client.get_log_signature()
+          ),
+          dicom_instances_metadata=instance.dicom_instances_metadata,
+      )
+      if series_images.dicom_slide is not None:
+        if series_images.dicom_microscope_image is not None:
+          msg = (
+              'Cannot return for DICOM images for '
+              ' VL_Whole_Slide_Microscopy_Images and DICOM Microscopic_Images'
+              ' in the same request.'
+          )
+          cloud_logging_client.info(msg)
+          raise data_accessor_errors.DicomError(msg)
+        ds = series_images.dicom_slide
+      elif series_images.dicom_microscope_image is not None:
+        ds = series_images.dicom_microscope_image
+      else:
+        msg = f'Could not find DICOM imaging; path: {series_path}.'
+        cloud_logging_client.info(msg)
+        raise data_accessor_errors.DicomPathError(msg)
+    except ez_wsi_errors.DicomSlideInitError as exp:
+      msg = f'DICOM metadata error; Path: {series_path}; {exp}'
+      cloud_logging_client.info(msg, exp)
+      raise data_accessor_errors.DicomError(msg) from exp
+    except (
+        ez_wsi_errors.SlideLevelContainsInstancesWithDifferentTransferSyntaxUIDError
+    ) as exp:
+      msg = (
+          'All DICOM instances in a pyramid level are required to have same'
+          ' TransferSyntaxUID.'
+      )
+      cloud_logging_client.info(msg, exp)
+      raise data_accessor_errors.DicomError(msg) from exp
+    except (
+        ez_wsi_errors.DicomTagNotFoundError,
+        ez_wsi_errors.InvalidDicomTagError,
+    ) as exp:
+      msg = f'DICOM instance missing required tags; Path: {series_path}; {exp}'
+      cloud_logging_client.info(msg, exp)
+      raise data_accessor_errors.DicomError(msg) from exp
+    except (
+        ez_wsi_errors.InvalidSlideJsonMetadataError,
+        ez_wsi_errors.SlidePathDoesNotMatchJsonMetadataError,
+        ez_wsi_errors.UnexpectedDicomObjectInstanceError,
+    ) as exp:
+      msg = 'Error decoding embedding request JSON metadata.'
+      cloud_logging_client.error(
+          msg,
+          {'slide_path_requested': series_path},
+          exp,
+      )
+      # If this occurs it would be a bug in the ez-wsi interface.
+      raise data_accessor_errors.EzWsiStateError(msg) from exp
+    cloud_logging_client.info(
+        f'Retrieved metadata for slide: {series_path};'
+        f' {time.time() - start_time} (sec).',
+        {'slide_path_requested': series_path},
+    )
+
+    if sop_instance_uid is not None:
+      # If SOP Instance is defined then load SOP Instance imaging
+      level = ds.get_instance_level(sop_instance_uid)
+      if level is None:
+        msg = (
+            f'{sop_instance_uid} is not part of DICOM WSI pyramid; path:'
+            f' {series_path}.'
+        )
+        cloud_logging_client.info(msg)
+        raise data_accessor_errors.LevelNotFoundError(msg)
+      levels = [level]
+      if (
+          last_sop_instance_defined_level is not None
+          and last_sop_instance_defined_level == level
+      ):
+        # if iterating over a list of sop instances then skip sequentially
+        # defined instances which define the same pyrmaid level,
+        # i.e. concatenated instances.
+        continue
+      last_sop_instance_defined_level = level
+    else:
+      last_sop_instance_defined_level = None
+      # slide id is defined by series not instances.
+      if isinstance(ds, dicom_slide.DicomSlide):
+        # If series is defined and WSI VL Image then if patch coordiantes are
+        # defined use the high magnification level for imaging.
+        try:
+          levels = [ds.native_level]
+        except ez_wsi_errors.LevelNotFoundError:
+          levels = []
+        if not instance.patch_coordinates or not levels:
+          # If patch coordinates are not defined then find find patch with
+          # dimensions that are closest to the model input dimensions.
+          # if no level found then defaults to available imaging.
+          test_levels = [] if ds.thumbnail is None else [ds.thumbnail]
+          test_levels.extend(ds.levels)
+          for level in sorted(test_levels, key=lambda l: l.width * l.height):
+            if (
+                level.width >= settings.endpoint_input_width
+                and level.height >= settings.endpoint_input_height
+            ):
+              levels = [level]
+              break
+        if not levels:
+          msg = (
+              f'DICOM {series_path} is missing WSI pyramid and WSI thumbnail'
+              ' image.'
+          )
+          cloud_logging_client.info(msg)
+          raise data_accessor_errors.LevelNotFoundError(msg)
+      elif isinstance(ds, dicom_slide.DicomMicroscopeImage):
+        # If series is defined and Microscopy Image is defined then iterator
+        # over all images. Here level corresponds to a unique image.
+        levels = ds.all_levels
+      else:
+        raise data_accessor_errors.InternalError(
+            'Unsupported DICOM slide type.'
+        )
+    for level in levels:
+      # create copy of ds to enable threaded loading of levels from the same
+      # slide.
+      ds_and_series_path_and_level_data_to_load.append(
+          (series_path, copy.copy(ds), level)
+      )
+  levels_to_load = len(ds_and_series_path_and_level_data_to_load)
+  if levels_to_load == 0:
+    return []
+  max_parallel_download_workers = max(1, settings.max_parallel_download_workers)
+  if levels_to_load == 1 or max_parallel_download_workers == 1:
+    return [
+        _load_slide_level(
+            instance,
+            settings,
+            require_fully_in_source_image,
+            resize_level_dim,
+            target_icc_profile,
+            ds_and_series_path_and_level_data,
+        )
+        for ds_and_series_path_and_level_data in (
+            ds_and_series_path_and_level_data_to_load
+        )
+    ]
+  with futures.ThreadPoolExecutor(
+      max_workers=max_parallel_download_workers
+  ) as executor:
+    return list(
+        executor.map(
+            functools.partial(
+                _load_slide_level,
+                instance,
+                settings,
+                require_fully_in_source_image,
+                resize_level_dim,
+                target_icc_profile,
+            ),
+            ds_and_series_path_and_level_data_to_load,
+        )
+    )
+
+
 def _get_dicom_patches(local_data: _LocalData) -> Iterator[np.ndarray]:
   """Returns image patch bytes from DICOM series."""
   if local_data.icc_profile_transformation is not None:
@@ -553,25 +656,31 @@ class DicomDigitalPathologyData(
   ):
     super().__init__(instance)
     self._settings = settings
-    self._local_data = None
+    self._local_data = []
+
+  @contextlib.contextmanager
+  def _reset_local_file_path(self, *args, **kwds):
+    del args, kwds
+    try:
+      yield
+    finally:
+      self._local_data = []
 
   def load_data(self, stack: contextlib.ExitStack) -> None:
     """Method pre-loads data prior to data_iterator."""
-    if self._local_data is not None:
+    if self._local_data:
       return
     self._local_data = _load_slide_data(self.instance, self._settings)
+    stack.enter_context(self._reset_local_file_path())
 
   def data_iterator(self) -> Iterator[np.ndarray]:
-    if self._local_data is None:
-      self._local_data = _load_slide_data(self.instance, self._settings)
-    return _get_dicom_patches(self._local_data)
+    for local_data in (
+        self._local_data
+        if self._local_data
+        else _load_slide_data(self.instance, self._settings)
+    ):
+      yield from _get_dicom_patches(local_data)
 
   def is_accessor_data_embedded_in_request(self) -> bool:
     """Returns true if data is inline with request."""
     return False
-
-  def __len__(self) -> int:
-    """Returns number of data sets returned by iterator."""
-    if self.instance.patch_coordinates:
-      return len(self.instance.patch_coordinates)
-    return 1

@@ -15,6 +15,7 @@
 
 from concurrent import futures
 import contextlib
+import functools
 import os
 import tempfile
 from typing import Iterator, Sequence
@@ -76,7 +77,8 @@ def _download_to_file(
 
 @retrying.retry(**error_retry_util.HTTP_AUTH_ERROR_RETRY_CONFIG)
 def _auth_retryable_gcs_download(
-    instance: data_accessor_definition.GcsGenericBlob,
+    credential_factory: credential_factory_module.AbstractCredentialFactory,
+    source_blob: google.cloud.storage.Blob,
     file_path: str,
     timeout: int,
     worker_type: str,
@@ -85,10 +87,10 @@ def _auth_retryable_gcs_download(
   """Download a GCS blob to a temporary file retrying on auth errors."""
   try:
     client = google.cloud.storage.Client(
-        credentials=instance.credential_factory.get_credentials()
+        credentials=credential_factory.get_credentials()
     )
     return _download_to_file(
-        client, instance.gcs_blob, file_path, timeout, worker_type, worker_count
+        client, source_blob, file_path, timeout, worker_type, worker_count
     )
   except google.api_core.exceptions.GoogleAPICallError as exp:
     raise ez_wsi_errors.raise_ez_wsi_http_exception(exp.message, exp)
@@ -96,14 +98,16 @@ def _auth_retryable_gcs_download(
 
 @retrying.retry(**error_retry_util.HTTP_SERVER_ERROR_RETRY_CONFIG)
 def _download_blob_to_file(
-    instance: data_accessor_definition.GcsGenericBlob,
-    file_path: str,
+    credential_factory: credential_factory_module.AbstractCredentialFactory,
+    base_dir: str,
     timeout: int,
     worker_type: str,
     worker_count: int,
+    blob_index: int,
+    source_blob: google.cloud.storage.Blob,
 ) -> str:
   """Download a GCS blob to a temporary file."""
-  credential_factory = instance.credential_factory
+  file_path = os.path.join(base_dir, f'{blob_index}.tmp')
   try:
     if isinstance(
         credential_factory,
@@ -113,7 +117,7 @@ def _download_blob_to_file(
       try:
         return _download_to_file(
             client,
-            instance.gcs_blob,
+            source_blob,
             file_path,
             timeout,
             worker_type,
@@ -126,7 +130,12 @@ def _download_blob_to_file(
         credential_factory_module.DefaultCredentialFactory,
     ):
       return _auth_retryable_gcs_download(
-          instance, file_path, timeout, worker_type, worker_count
+          credential_factory,
+          source_blob,
+          file_path,
+          timeout,
+          worker_type,
+          worker_count,
       )
     else:
       client = google.cloud.storage.Client(
@@ -134,7 +143,7 @@ def _download_blob_to_file(
       )
       return _download_to_file(
           client,
-          instance.gcs_blob,
+          source_blob,
           file_path,
           timeout,
           worker_type,
@@ -144,29 +153,70 @@ def _download_blob_to_file(
     raise ez_wsi_errors.raise_ez_wsi_http_exception(exp.message, exp)
 
 
+def _download_blob_to_file_exception_wrapper(
+    credential_factory: credential_factory_module.AbstractCredentialFactory,
+    base_dir: str,
+    timeout: int,
+    worker_type: str,
+    worker_count: int,
+    source_index_and_blob: tuple[int, google.cloud.storage.Blob],
+) -> str:
+  """Download a GCS blob to a temporary file."""
+  source_index, source_blob = source_index_and_blob
+  try:
+    return _download_blob_to_file(
+        credential_factory,
+        base_dir,
+        timeout,
+        worker_type,
+        worker_count,
+        source_index,
+        source_blob,
+    )
+  except google.api_core.exceptions.GoogleAPICallError as exp:
+    raise data_accessor_errors.HttpError(exp.message) from exp
+  except ez_wsi_errors.HttpError as exp:
+    raise data_accessor_errors.HttpError(str(exp)) from exp
+
+
 def _download_gcs_data(
     context: contextlib.ExitStack,
     instance: data_accessor_definition.GcsGenericBlob,
     timeout: int,
     worker_type: str,
     worker_count: int,
-) -> str:
+    max_parallel_download_workers: int,
+) -> Sequence[str]:
   """Downloads GCS data to a temporary file."""
   base_dir = context.enter_context(tempfile.TemporaryDirectory())
-  file_path = os.path.join(base_dir, os.path.basename(instance.gcs_blob.name))
-  try:
-    _download_blob_to_file(
-        instance,
-        file_path,
-        timeout,
-        worker_type,
-        worker_count,
+  if len(instance.gcs_blobs) == 1 or max_parallel_download_workers <= 1:
+    return [
+        _download_blob_to_file_exception_wrapper(
+            instance.credential_factory,
+            base_dir,
+            timeout,
+            worker_type,
+            worker_count,
+            (i, b),
+        )
+        for i, b in enumerate(instance.gcs_blobs)
+    ]
+  with futures.ThreadPoolExecutor(
+      max_workers=max_parallel_download_workers
+  ) as executor:
+    return list(
+        executor.map(
+            functools.partial(
+                _download_blob_to_file_exception_wrapper,
+                instance.credential_factory,
+                base_dir,
+                timeout,
+                worker_type,
+                worker_count,
+            ),
+            enumerate(instance.gcs_blobs),
+        )
     )
-    return file_path
-  except google.api_core.exceptions.GoogleAPICallError as exp:
-    raise data_accessor_errors.HttpError(exp.message) from exp
-  except ez_wsi_errors.HttpError as exp:
-    raise data_accessor_errors.HttpError(str(exp)) from exp
 
 
 def _get_gcs_blob(
@@ -175,30 +225,26 @@ def _get_gcs_blob(
     timeout: int,
     worker_type: str,
     worker_count: int,
-    file_path: str,
+    max_parallel_download_workers: int,
+    file_paths: Sequence[str],
 ) -> Iterator[np.ndarray]:
   """Returns image patch bytes from DICOM series."""
   with contextlib.ExitStack() as stack:
-    if not file_path:
-      file_path = _download_gcs_data(
-          stack, instance, timeout, worker_type, worker_count
+    if not file_paths:
+      file_paths = _download_gcs_data(
+          stack,
+          instance,
+          timeout,
+          worker_type,
+          worker_count,
+          max_parallel_download_workers,
       )
-    for file_handler in file_handlers:
-      processed = file_handler.process_file(
-          instance.patch_coordinates,
-          instance.base_request,
-          file_path,
-      )
-      yield_result = False
-      for data in processed:
-        yield data
-        yield_result = True
-      if yield_result:
-        return
-
-  raise data_accessor_errors.UnhandledGcsFileError(
-      'No file handler processed the files.'
-  )
+    yield from abstract_handler.process_files_with_handlers(
+        file_handlers,
+        instance.patch_coordinates,
+        instance.base_request,
+        file_paths,
+    )
 
 
 class GcsGenericData(
@@ -215,13 +261,15 @@ class GcsGenericData(
       download_timeout: int = 600,
       download_worker_type: str = 'process',
       download_worker_count: int = 1,
+      max_parallel_download_workers: int = 1,
   ):
     super().__init__(instance_class)
     self._file_handlers = file_handlers
     self._download_timeout = download_timeout
     self._download_worker_type = download_worker_type
     self._download_worker_count = download_worker_count
-    self._local_file_path = ''
+    self._max_parallel_download_workers = max(1, max_parallel_download_workers)
+    self._local_file_paths = []
 
   def is_accessor_data_embedded_in_request(self) -> bool:
     """Returns true if data is inline with request."""
@@ -233,7 +281,7 @@ class GcsGenericData(
     try:
       yield
     finally:
-      self._local_file_path = ''
+      self._local_file_paths = []
 
   def load_data(self, stack: contextlib.ExitStack) -> None:
     """Method pre-loads data prior to data_iterator.
@@ -247,14 +295,15 @@ class GcsGenericData(
     Returns:
       None
     """
-    if self._local_file_path:
+    if self._local_file_paths:
       return
-    self._local_file_path = _download_gcs_data(
+    self._local_file_paths = _download_gcs_data(
         stack,
         self.instance,
         self._download_timeout,
         self._download_worker_type,
         self._download_worker_count,
+        self._max_parallel_download_workers,
     )
     stack.enter_context(self._reset_local_file_path())
 
@@ -265,11 +314,6 @@ class GcsGenericData(
         self._download_timeout,
         self._download_worker_type,
         self._download_worker_count,
-        self._local_file_path,
+        self._max_parallel_download_workers,
+        self._local_file_paths,
     )
-
-  def __len__(self) -> int:
-    """Returns number of data sets returned by iterator."""
-    if self.instance.patch_coordinates:
-      return len(self.instance.patch_coordinates)
-    return 1

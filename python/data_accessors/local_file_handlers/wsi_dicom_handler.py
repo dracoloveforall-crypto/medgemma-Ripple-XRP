@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """local handler for handling traditional image files."""
+
 import io
 import math
 from typing import Any, Iterator, Mapping, Optional, Sequence, Tuple, Union
@@ -58,7 +59,7 @@ def _get_compressed_dicom_frame_bytes(
     raise data_accessor_errors.DicomError('DICOM missing PixelData.')
   try:
     number_of_frames = int(dcm.NumberOfFrames)
-  except (TypeError, ValueError, AttributeError) as _:
+  except (TypeError, ValueError, AttributeError):
     number_of_frames = 1
   if number_of_frames < 1:
     raise data_accessor_errors.DicomError('Invalid number of frames in DICOM.')
@@ -103,7 +104,15 @@ def _get_frame(
     frames_per_column: int,
 ) -> np.ndarray:
   """Returns a frame from a DICOM instance."""
-  if frame_x_offset >= frames_per_row or frame_y_offset >= frames_per_column:
+  try:
+    number_of_frames = int(dcm.NumberOfFrames)
+  except (ValueError, AttributeError, TypeError):
+    number_of_frames = 1
+  if (
+      frame_x_offset >= frames_per_row
+      or frame_y_offset >= frames_per_column
+      or frame_index >= number_of_frames
+  ):
     frame_data = _get_frame(
         dcm, dicom_frames, 0, 0, 0, frames_per_row, frames_per_column
     )
@@ -337,49 +346,64 @@ def _decode_dicom_image(
 class WsiDicomHandler(abstract_handler.AbstractHandler):
   """Reads a traditional image from local file system."""
 
-  def process_file(
+  def process_files(
       self,
       instance_patch_coordinates: Sequence[
           patch_coordinate_module.PatchCoordinate
       ],
       base_request: Mapping[str, Any],
-      file_path: Union[str, io.BytesIO],
+      file_paths: abstract_handler.InputFileIterator,
   ) -> Iterator[np.ndarray]:
-    is_binary_io = isinstance(file_path, io.BytesIO)
     instance_extensions = abstract_handler.get_base_request_extensions(
         base_request
     )
-    try:
-      if is_binary_io:
-        file_path.seek(0)  # pytype: disable=attribute-error
-      with pydicom.dcmread(file_path, specific_tags=['SOPClassUID']) as dcm:
-        if (
-            dcm.SOPClassUID
-            != dicom_source_utils.VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_SOP_CLASS_UID
-        ):
-          return
-      if is_binary_io:
-        file_path.seek(0)  # pytype: disable=attribute-error
-      with pydicom.dcmread(file_path) as dcm:
-        target_icc_profile = icc_profile_utils.get_target_icc_profile(
-            instance_extensions
-        )
-        patch_required_to_be_fully_in_source_image = (
-            patch_coordinate_module.patch_required_to_be_fully_in_source_image(
-                instance_extensions
+    for file_path in file_paths:
+      try:
+        with pydicom.dcmread(file_path, specific_tags=['SOPClassUID']) as dcm:
+          if (
+              dcm.SOPClassUID
+              != dicom_source_utils.VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_SOP_CLASS_UID
+          ):
+            return
+        if isinstance(file_path, io.BytesIO):
+          file_path.seek(0)  # pytype: disable=attribute-error
+        with pydicom.dcmread(file_path) as dcm:
+          try:
+            number_of_frames = int(dcm.NumberOfFrames)
+          except (ValueError, AttributeError, TypeError):
+            number_of_frames = 1
+          if (
+              number_of_frames > 1
+              and dcm.DimensionOrganizationType != 'TILED_FULL'
+          ):
+            raise data_accessor_errors.DicomTiledFullError(
+                'DICOM DimensionOrganizationType is not TILED_FULL.'
             )
-        )
-        resize_image_dimensions = (
-            image_dimension_utils.get_resize_image_dimensions(
-                instance_extensions
+          if 'ConcatenationUID' in dcm and dcm.ConcatenationUID:
+            raise data_accessor_errors.DicomError(
+                'Reading concatenated WSI DICOM from sources other than a DICOM'
+                ' store is not supported.'
             )
-        )
-        yield from _decode_dicom_image(
-            dcm,
-            target_icc_profile,
-            instance_patch_coordinates,
-            resize_image_dimensions,
-            patch_required_to_be_fully_in_source_image,
-        )
-    except pydicom.errors.InvalidDicomError:
-      return
+          target_icc_profile = icc_profile_utils.get_target_icc_profile(
+              instance_extensions
+          )
+          patch_required_to_be_fully_in_source_image = patch_coordinate_module.patch_required_to_be_fully_in_source_image(
+              instance_extensions
+          )
+          resize_image_dimensions = (
+              image_dimension_utils.get_resize_image_dimensions(
+                  instance_extensions
+              )
+          )
+          yield from _decode_dicom_image(
+              dcm,
+              target_icc_profile,
+              instance_patch_coordinates,
+              resize_image_dimensions,
+              patch_required_to_be_fully_in_source_image,
+          )
+          # mark file as being processed so custom iterator will now return next
+          # file in sequence.
+          file_paths.processed_file()
+      except pydicom.errors.InvalidDicomError:
+        return

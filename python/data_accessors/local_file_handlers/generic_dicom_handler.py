@@ -14,6 +14,7 @@
 """local handler for handling generic DICOM files."""
 
 import abc
+import dataclasses
 import io
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence, Union
 
@@ -66,6 +67,22 @@ _SUPPORTED_UNENCAPSULATED_PHOTOMETRIC_INTERPRETATIONS = frozenset(
 )
 
 _SUPPORTED_SAMPLES_PER_PIXEL = frozenset([1, 3])
+
+_MODALITY = dicom_source_utils.MODALITY
+_CXR_MODALITIES = dicom_source_utils.CXR_MODALITIES
+_WINDOWED_MODALITIES = (_MODALITY.CT,) + _CXR_MODALITIES
+
+_DICOM_TAG_KEYWORDS_EQUAL_VALUE_FOR_INSTANCES_IN_SAME_ACQUISITION = (
+    'SOPClassUID',
+    'StudyInstanceUID',
+    'SeriesInstanceUID',
+    'ImageType',
+    'AcquisitionUID',
+    'AcquisitionNumber',
+    'AcquisitionDateTime',
+    'AcquisitionDate',
+    'AcquisitionTime',
+)
 
 
 class ImageTransform(metaclass=abc.ABCMeta):
@@ -209,7 +226,7 @@ class RGBWindow(ImageTransform):
     return np.concatenate([red, green, blue], axis=-1)
 
 
-class MaxDynamicRangeImageTransform(ImageTransform):
+class NopImageTransform(ImageTransform):
   """Default operation used to transform MRI imaging for model input.
 
   MRI imaging is commonly expressed 16-bit values. Unlike CT the imaging is
@@ -218,106 +235,26 @@ class MaxDynamicRangeImageTransform(ImageTransform):
   by scaling the values across the dynamic range.
   """
 
-  def __init__(self, dtype: Optional[Union[_UINT8_TYPE, _UINT16_TYPE]]):
-    self._output_dtype = dtype
-    if dtype not in (np.uint8, np.uint16):
-      raise ValueError(
-          f'Output dtype must be either uint8 or uint16, got {dtype}.'
-      )
-
   def apply(self, image: np.ndarray) -> np.ndarray:
-    image = image.astype(np.float64)
-    image -= np.min(image)
-    image /= np.max(image)
-    image *= np.iinfo(self._output_dtype).max
-    np.round(image, 0, out=image)
-    return image.astype(self._output_dtype)
+    return image
 
 
 # Default CT Window for MedGemma 1.0
-_MedGemma_1_CT_DEFAULT_WINDOW = RGBWindow(
+_MEDGEMMA_1_CT_DEFAULT_WINDOW = RGBWindow(
     TraditionalWindow(0, 2048),
     TraditionalWindow(175, 80),
     TraditionalWindow(40, 80),
 )
 
 
-class _MODALITY:
-  """Modality Coded Values."""
-
-  CR = 'CR'  # Computed Radiography
-  DX = 'DX'  # Digital X-Ray
-  GM = 'GM'  # General Microscopy
-  SM = 'SM'  # Slide Microscopy
-  XC = 'XC'  # External Camera
-  CT = 'CT'  # Computed Tomography
-  MR = 'MR'  # Magnetic Resonance
-
-
-_CXR_MODALITIES = (_MODALITY.CR, _MODALITY.DX)
-_CT_AND_MRI_MODALITIES = (_MODALITY.CT, _MODALITY.MR)
-_WINDOWED_MODALITIES = _CT_AND_MRI_MODALITIES + _CXR_MODALITIES
-_MICROSCOPY_MODALITIES = (_MODALITY.SM, _MODALITY.GM)
-_CT_SOP_CLASS_UIDS = frozenset([
-    '1.2.840.10008.5.1.4.1.1.2',
-    '1.2.840.10008.5.1.4.1.1.2.1',
-    '1.2.840.10008.5.1.4.1.1.2.2',
-])
-
-_MR_SOP_CLASS_UIDS = frozenset([
-    '1.2.840.10008.5.1.4.1.1.4',
-    '1.2.840.10008.5.1.4.1.1.4.1',
-    '1.2.840.10008.5.1.4.1.1.4.4',
-])
-_SM_SOP_CLASS_UIDS = frozenset([
-    '1.2.840.10008.5.1.4.1.1.77.1.3',
-    '1.2.840.10008.5.1.4.1.1.77.1.2',
-    '1.2.840.10008.5.1.4.1.1.77.1.6',
-])
-_DX_SOP_CLASS_UIDS = frozenset([
-    '1.2.840.10008.5.1.4.1.1.1.1',
-    '1.2.840.10008.5.1.4.1.1.1.1.1',
-    '1.2.840.10008.5.1.4.1.1.1.2',
-    '1.2.840.10008.5.1.4.1.1.1.2.1',
-    '1.2.840.10008.5.1.4.1.1.1.3',
-    '1.2.840.10008.5.1.4.1.1.1.3.1',
-])
-
-
-def infer_modality_from_sop_class_uid(sop_class_uid: str) -> str:
-  """Infers modality from SOP Class UID."""
-  if sop_class_uid in _CT_SOP_CLASS_UIDS:
-    return _MODALITY.CT
-  if sop_class_uid in _MR_SOP_CLASS_UIDS:
-    return _MODALITY.MR
-  if sop_class_uid in _SM_SOP_CLASS_UIDS:
-    return _MODALITY.SM
-  if sop_class_uid == '1.2.840.10008.5.1.4.1.1.1':
-    return _MODALITY.CR
-  if sop_class_uid in _DX_SOP_CLASS_UIDS:
-    return _MODALITY.DX
-  return ''
-
-
-def _validate_modality_supported(modality: str) -> None:
-  """Validates DICOM modality is supported."""
-  if modality in _CXR_MODALITIES:
-    return
-  if modality in _MICROSCOPY_MODALITIES:
-    return
-  if modality in _MODALITY.XC:
-    return
-  if modality == _MODALITY.CT:
-    return
-  if modality == _MODALITY.MR:
-    return
-  raise data_accessor_errors.DicomError(
-      f'DICOM encodes a unsupported Modality; Modality: {modality}.'
-  )
-
-
 def validate_transfer_syntax(dcm: pydicom.FileDataset) -> None:
-  transfer_syntax_uid = dcm.file_meta.TransferSyntaxUID
+  """Validates the transfer syntax of the DICOM instance."""
+  try:
+    transfer_syntax_uid = dcm.file_meta.TransferSyntaxUID
+  except (AttributeError, ValueError) as exp:
+    raise data_accessor_errors.DicomError(
+        'DICOM missing TransferSyntaxUID.'
+    ) from exp
   if transfer_syntax_uid in VALID_UNENCAPSULATED_DICOM_TRANSFER_SYNTAXES:
     return
   if dicom_frame_decoder.can_decompress_dicom_transfer_syntax(
@@ -364,10 +301,12 @@ def _transform_image_to_target_icc_profile(
   )
 
 
-def _get_encapsulated_dicom_frame_bytes(ds: pydicom.FileDataset) -> bytes:
+def _get_encapsulated_dicom_frame_bytes(
+    ds: pydicom.FileDataset,
+) -> Iterator[bytes]:
   """Returns DICOM bytes from encapsulated PixelData."""
   if _PIXEL_DATA not in ds or not ds.PixelData:
-    return b''
+    return iter([])
   try:
     number_of_frames = int(ds.NumberOfFrames)
   except (TypeError, ValueError, AttributeError) as _:
@@ -375,22 +314,65 @@ def _get_encapsulated_dicom_frame_bytes(ds: pydicom.FileDataset) -> bytes:
     # tag. For these IOD, we assume that the image has only one frame.
     number_of_frames = 1
   if number_of_frames < 1:
-    return b''
+    return iter([])
+  # pytype: disable=module-attr
   if _PYDICOM_MAJOR_VERSION <= 2:
-    # pytype: disable=module-attr
-    frame_bytes_generator = pydicom.encaps.generate_pixel_data_frame(
+    return pydicom.encaps.generate_pixel_data_frame(
         ds.PixelData, number_of_frames
     )
-    # pytype: enable=module-attr
-  else:
-    # pytype: disable=module-attr
-    frame_bytes_generator = pydicom.encaps.generate_frames(
-        ds.PixelData, number_of_frames=number_of_frames
+  return pydicom.encaps.generate_frames(
+      ds.PixelData, number_of_frames=number_of_frames
+  )
+  # pytype: enable=module-attr
+
+
+@dataclasses.dataclass(frozen=True)
+class _FrameBytes:
+  compressed_frame_bytes: bytes
+  decoded_frame_bytes: np.ndarray
+
+
+def _decode_encapsulated_dicom_frames(
+    dcm: pydicom.FileDataset, dicom_frames_compressed_bytes: Iterator[bytes]
+) -> Iterator[_FrameBytes]:
+  """Decodes compressed DICOM frames."""
+  transfer_syntax_uid = dcm.file_meta.TransferSyntaxUID
+  missing_pixel_data = True
+  for compressed_frame_bytes in dicom_frames_compressed_bytes:
+    decoded_frame_bytes = (
+        dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
+            compressed_frame_bytes, transfer_syntax_uid
+        )
     )
-    # pytype: enable=module-attr
-  for frame_bytes in frame_bytes_generator:
-    return frame_bytes
-  return b''
+    if decoded_frame_bytes is None:
+      raise data_accessor_errors.DicomError('Cannot decode DICOM pixel data.')
+    if dcm.SamplesPerPixel == 1 and decoded_frame_bytes.shape[2] == 3:
+      decoded_frame_bytes = decoded_frame_bytes[..., 0]
+    missing_pixel_data = False
+    yield _FrameBytes(compressed_frame_bytes, decoded_frame_bytes)
+  if missing_pixel_data:
+    raise data_accessor_errors.DicomError('DICOM instance missing PixelData.')
+
+
+def _decode_unencapsulated_dicom_frames(
+    dcm: pydicom.FileDataset,
+) -> Iterator[_FrameBytes]:
+  """Decodes uncompressed DICOM frames."""
+  try:
+    if not dcm.PixelData:
+      raise data_accessor_errors.DicomError('DICOM instance missing PixelData.')
+    if dcm.SamplesPerPixel == 1 and dcm.pixel_array.ndim == 3:
+      for frame_index in range(dcm.pixel_array.shape[0]):
+        yield _FrameBytes(b'', dcm.pixel_array[frame_index])
+    elif dcm.SamplesPerPixel > 1 and dcm.pixel_array.ndim == 4:
+      for frame_index in range(dcm.pixel_array.shape[0]):
+        yield _FrameBytes(b'', dcm.pixel_array[frame_index])
+    else:
+      yield _FrameBytes(b'', dcm.pixel_array)
+  except (AttributeError, ValueError) as exp:
+    raise data_accessor_errors.DicomError(
+        'DICOM instance missing PixelData.'
+    ) from exp
 
 
 def _rescale_cxr_dynamic_range(image_bytes: np.ndarray) -> np.ndarray:
@@ -449,19 +431,17 @@ def _norm_cxr_imaging(
 
 def _default_ct_volume_window_op(unused_dcm: pydicom.Dataset) -> RGBWindow:
   """Returns default window operation for CT imaging."""
-  return _MedGemma_1_CT_DEFAULT_WINDOW
+  return _MEDGEMMA_1_CT_DEFAULT_WINDOW
 
 
 def _default_mri_volume_window_op(
-    dcm: pydicom.Dataset,
-) -> Union[TraditionalWindow, MaxDynamicRangeImageTransform]:
+    unused_dcm: pydicom.Dataset,
+) -> NopImageTransform:
   """Returns default window operation for MRI imaging."""
-  if _WINDOW_WIDTH in dcm and _WINDOW_CENTER in dcm:
-    return TraditionalWindow(dcm.WindowCenter, dcm.WindowWidth)
-  return MaxDynamicRangeImageTransform(np.uint8)
+  return NopImageTransform()
 
 
-def _norm_radiology_volume_imaging(
+def _norm_ct_imaging(
     window: Optional[ImageTransform],
     arr: np.ndarray,
     ds: pydicom.FileDataset,
@@ -522,26 +502,6 @@ def validate_samples_per_pixel_and_photometric_interpretation_match(
         'DICOM instance has 1 sample per pixel but contains multichannel'
         ' PhotometricInterpretation.'
     )
-  if (
-      dcm.SamplesPerPixel == 3
-      and dcm.PhotometricInterpretation
-      in _SINGLE_CHANNEL_PHOTOMETRIC_INTERPRETATION
-  ):
-    raise data_accessor_errors.DicomError(
-        'DICOM instance has 3 sample per pixel but contains single channel'
-        ' PhotometricInterpretation.'
-    )
-
-
-def _validate_number_of_frames(dcm: pydicom.FileDataset) -> None:
-  try:
-    if int(dcm.NumberOfFrames) != 1:
-      raise data_accessor_errors.DicomError(
-          'DICOM contains more than one frame; number of frames:'
-          f' {dcm.NumberOfFrames}.'
-      )
-  except (TypeError, ValueError, AttributeError) as _:
-    return
 
 
 def validate_unencapsulated_photometric_interpretation(
@@ -574,13 +534,16 @@ _DEFAULT_MODALITY_IMAGE_TRANSFORMS = {
 
 
 def _get_dicom_modality(dcm: pydicom.FileDataset) -> str:
+  """Returns modality of DICOM instance."""
   try:
     modality = dcm.Modality
     if modality:
       return modality
   except (AttributeError, ValueError, TypeError) as _:
     pass
-  modality = infer_modality_from_sop_class_uid(dcm.SOPClassUID)
+  modality = dicom_source_utils.infer_modality_from_sop_class_uid(
+      dcm.SOPClassUID
+  )
   if modality:
     return modality
   raise data_accessor_errors.DicomError(
@@ -607,85 +570,188 @@ def _get_modality_image_transform(
   ].get_image_image_transform(dcm)
 
 
-def decode_dicom_image(
+def _decode_dicom_image(
     dcm: pydicom.FileDataset,
     target_icc_profile: Optional[ImageCms.core.CmsProfile],
-    patch_coordinates: Sequence[patch_coordinate_module.PatchCoordinate],
-    resize_image_dimensions: Optional[image_dimension_utils.ImageDimensions],
-    patch_required_to_be_fully_in_source_image: bool,
+) -> Iterator[np.ndarray]:
+  """Decode DICOM image and return decoded image bytes."""
+  validate_transfer_syntax(dcm)
+  validate_samples_per_pixel(dcm)
+  encapsulated_dicom = dicom_frame_decoder.can_decompress_dicom_transfer_syntax(
+      dcm.file_meta.TransferSyntaxUID
+  )
+  if encapsulated_dicom:
+    image_frame_generator = _decode_encapsulated_dicom_frames(
+        dcm, _get_encapsulated_dicom_frame_bytes(dcm)
+    )
+  else:
+    validate_unencapsulated_photometric_interpretation(dcm)
+    image_frame_generator = _decode_unencapsulated_dicom_frames(dcm)
+  validate_samples_per_pixel_and_photometric_interpretation_match(dcm)
+  for frame_image_bytes in image_frame_generator:
+    decoded_frame_bytes = frame_image_bytes.decoded_frame_bytes
+    if dcm.SamplesPerPixel == 1 and decoded_frame_bytes.ndim == 2:
+      decoded_frame_bytes = np.expand_dims(decoded_frame_bytes, 2)
+    decoded_frame_bytes = _transform_image_to_target_icc_profile(
+        decoded_frame_bytes,
+        frame_image_bytes.compressed_frame_bytes,
+        dcm,
+        target_icc_profile,
+    )
+    yield decoded_frame_bytes
+
+
+def _decode_dicom_images(
+    base_request: Mapping[str, Any],
+    file_paths: abstract_handler.InputFileIterator,
+    raise_error_if_invalid_dicom: bool = False,
+) -> Iterator[tuple[pydicom.FileDataset, np.ndarray]]:
+  """Decodes Images contained in iterator of DICOM files."""
+  instance_extensions = abstract_handler.get_base_request_extensions(
+      base_request
+  )
+  for file_path in file_paths:
+    try:
+      with pydicom.dcmread(file_path, specific_tags=['SOPClassUID']) as dcm:
+        if (
+            dcm.SOPClassUID
+            == dicom_source_utils.VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_SOP_CLASS_UID
+        ):
+          return
+      if isinstance(file_path, io.BytesIO):
+        file_path.seek(0)
+      with pydicom.dcmread(file_path) as dcm:
+        target_icc_profile = icc_profile_utils.get_target_icc_profile(
+            instance_extensions
+        )
+        if 'ConcatenationUID' in dcm and dcm.ConcatenationUID:
+          raise data_accessor_errors.DicomError(
+              'Concatenated DICOM are not supported.'
+          )
+        # currently only process one file at a time.
+        # change to enable multiple files for mri volume norm.
+        for img in _decode_dicom_image(
+            dcm,
+            target_icc_profile,
+        ):
+          yield dcm, img
+        # mark file as being processed so custom iterator will now return next
+        # file in sequence.
+        file_paths.processed_file()
+    except pydicom.errors.InvalidDicomError:
+      # The handler is purposefully eating the message here.
+      # if a handler fails to process the image it returns an empty iterator.
+      if raise_error_if_invalid_dicom:
+        raise
+      return
+
+
+def _process_buffered_mri_volume(
+    images: Sequence[np.ndarray],
+) -> Iterator[np.ndarray]:
+  """Post process buffered MRI volumes."""
+  # MRI imaging is commonly expressed 16-bit values. Unlike CT the imaging is
+  # typically not captured in a calibrated acquision, i.e. the voxel values have
+  # reliative meaning only. MRI imaging is commonly transformed for
+  # visualization by scaling the values across the dynamic range.
+  if not images:
+    return
+  output_dtype = np.uint8
+  max_dtype_value = np.iinfo(output_dtype).max
+  min_val = np.min(images)
+  max_delta = np.max(images) - min_val
+  for image in images:
+    image = image.astype(np.float64)
+    if max_delta == 0:
+      image[...] = max_dtype_value
+    else:
+      image -= min_val
+      image /= max_delta
+      image *= max_dtype_value
+      np.round(image, 0, out=image)
+    yield image.astype(output_dtype)
+
+
+def _same_acquisition(
+    buffered_dicom: Optional[pydicom.FileDataset], dcm: pydicom.FileDataset
+) -> bool:
+  """Returns true if the two dicoms are from the same acquisition."""
+  if buffered_dicom is None:
+    return False
+  for kw in _DICOM_TAG_KEYWORDS_EQUAL_VALUE_FOR_INSTANCES_IN_SAME_ACQUISITION:
+    if buffered_dicom.get(kw) != dcm.get(kw):
+      return False
+  return True
+
+
+def _modality_norm(
     modality_default_image_transform: Mapping[
         str, ModalityDefaultImageTransform
     ],
+    dicom_images: Iterator[tuple[pydicom.FileDataset, np.ndarray]],
 ) -> Iterator[np.ndarray]:
-  """Decode DICOM image and return decoded image bytes."""
-  modality = _get_dicom_modality(dcm)
-  _validate_modality_supported(modality)
-  validate_transfer_syntax(dcm)
-  validate_samples_per_pixel(dcm)
-  _validate_number_of_frames(dcm)
-  image_transform = _get_modality_image_transform(
-      dcm, modality, modality_default_image_transform
-  )
-  try:
-    encapsulated_dicom = (
-        dicom_frame_decoder.can_decompress_dicom_transfer_syntax(
-            dcm.file_meta.TransferSyntaxUID
-        )
-    )
-  except (AttributeError, ValueError) as exp:
-    raise data_accessor_errors.DicomError(
-        'DICOM missing TransferSyntaxUID.'
-    ) from exp
-  if encapsulated_dicom:
-    compressed_image_bytes = _get_encapsulated_dicom_frame_bytes(dcm)
-    if not compressed_image_bytes:
-      raise data_accessor_errors.DicomError('DICOM missing pixel data.')
-    try:
-      transfer_syntax_uid = dcm.file_meta.TransferSyntaxUID
-    except (AttributeError, ValueError) as exp:
-      raise data_accessor_errors.DicomError(
-          'DICOM missing TransferSyntaxUID.'
-      ) from exp
-    decoded_image_bytes = (
-        dicom_frame_decoder.decode_dicom_compressed_frame_bytes(
-            compressed_image_bytes, transfer_syntax_uid
-        )
-    )
-    if decoded_image_bytes is None:
-      raise data_accessor_errors.DicomError('DICOM cannot decode pixel data.')
-    if dcm.SamplesPerPixel == 1 and decoded_image_bytes.shape[2] == 3:
-      decoded_image_bytes = decoded_image_bytes[..., 0]
-  else:
-    compressed_image_bytes = b''
-    validate_unencapsulated_photometric_interpretation(dcm)
-    try:
-      decoded_image_bytes = dcm.pixel_array
-    except (AttributeError, ValueError) as exp:
-      raise data_accessor_errors.DicomError(
-          f'Cannot decode pixel data: {exp}.'
-      ) from exp
-  validate_samples_per_pixel_and_photometric_interpretation_match(dcm)
-  if dcm.SamplesPerPixel == 1 and decoded_image_bytes.ndim == 2:
-    decoded_image_bytes = np.expand_dims(decoded_image_bytes, 2)
-  decoded_image_bytes = _transform_image_to_target_icc_profile(
-      decoded_image_bytes, compressed_image_bytes, dcm, target_icc_profile
-  )
-  if decoded_image_bytes.ndim == 3 and decoded_image_bytes.shape[2] == 1:
-    if modality in _CXR_MODALITIES:
-      decoded_image_bytes = _norm_cxr_imaging(
-          image_transform, decoded_image_bytes, dcm
+  """Post process DICOM images from same acquisition."""
+  buffered_dicom = None
+  buffered_images = []
+  for dcm, img in dicom_images:
+    modality = _get_dicom_modality(dcm)
+    dicom_source_utils.validate_modality_supported(modality)
+    if modality != _MODALITY.MR:
+      # if not MRI volume then yield any buffered mri images and then
+      # yield the current image.
+      if buffered_images:
+        yield from _process_buffered_mri_volume(buffered_images)
+        buffered_images = []
+        buffered_dicom = None
+      image_transform = _get_modality_image_transform(
+          dcm, modality, modality_default_image_transform
       )
-    elif modality in _CT_AND_MRI_MODALITIES:
-      decoded_image_bytes = _norm_radiology_volume_imaging(
-          image_transform, decoded_image_bytes, dcm
+      if img.ndim == 3 and img.shape[2] == 1:
+        if modality in _CXR_MODALITIES:
+          img = _norm_cxr_imaging(image_transform, img, dcm)
+        elif modality in _MODALITY.CT:
+          img = _norm_ct_imaging(image_transform, img, dcm)
+      yield img
+      continue
+    if buffered_images and not _same_acquisition(buffered_dicom, dcm):
+      # if not same MRI acquisition then yield any buffered mri images
+      yield from _process_buffered_mri_volume(buffered_images)
+      buffered_images = []
+    # buffer MRI images for processing later.
+    buffered_dicom = dcm
+    buffered_images.append(img)
+  if buffered_images:
+    # yield any remaining buffered mri images.
+
+    # pylint: disable=undefined-variable
+    # pylint: disable=undefined-loop-variable
+    yield from _process_buffered_mri_volume(buffered_images)
+    # pylint: enable=undefined-variable
+    # pylint: enable=undefined-loop-variable
+
+
+def _generate_acquisition_images(
+    instance_extensions: Mapping[str, Any],
+    patch_coordinates: Sequence[patch_coordinate_module.PatchCoordinate],
+    decoded_images: Iterator[np.ndarray],
+) -> Iterator[np.ndarray]:
+  """Process images from same acquisition."""
+  patch_required_to_be_fully_in_source_image = (
+      patch_coordinate_module.patch_required_to_be_fully_in_source_image(
+          instance_extensions
       )
-  if resize_image_dimensions is not None:
-    decoded_image_bytes = image_dimension_utils.resize_image_dimensions(
-        decoded_image_bytes, resize_image_dimensions
-    )
-  if not patch_coordinates:
-    yield decoded_image_bytes
-  else:
+  )
+  resize_image_dimensions = image_dimension_utils.get_resize_image_dimensions(
+      instance_extensions
+  )
+  for decoded_image_bytes in decoded_images:
+    if resize_image_dimensions is not None:
+      decoded_image_bytes = image_dimension_utils.resize_image_dimensions(
+          decoded_image_bytes, resize_image_dimensions
+      )
+    if not patch_coordinates:
+      yield decoded_image_bytes
+      continue
     image_shape = image_dimension_utils.ImageDimensions(
         width=decoded_image_bytes.shape[1],
         height=decoded_image_bytes.shape[0],
@@ -706,57 +772,33 @@ class GenericDicomHandler(abstract_handler.AbstractHandler):
       modality_default_image_transform: Optional[
           Mapping[str, ModalityDefaultImageTransform]
       ] = None,
+      raise_error_if_invalid_dicom: bool = False,
   ):
     super().__init__()
+    self._raise_error_if_invalid_dicom = raise_error_if_invalid_dicom
     self._modality_default_image_transform = (
         modality_default_image_transform
         if modality_default_image_transform is not None
         else {}
     )
 
-  def process_file(
+  def process_files(
       self,
       instance_patch_coordinates: Sequence[
           patch_coordinate_module.PatchCoordinate
       ],
       base_request: Mapping[str, Any],
-      file_path: Union[str, io.BytesIO],
+      file_paths: abstract_handler.InputFileIterator,
   ) -> Iterator[np.ndarray]:
-    instance_extensions = abstract_handler.get_base_request_extensions(
-        base_request
-    )
-    try:
-      with pydicom.dcmread(file_path, specific_tags=['SOPClassUID']) as dcm:
-        if (
-            dcm.SOPClassUID
-            == dicom_source_utils.VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_SOP_CLASS_UID
-        ):
-          return
-      if isinstance(file_path, io.BytesIO):
-        file_path.seek(0)
-      with pydicom.dcmread(file_path) as dcm:
-        target_icc_profile = icc_profile_utils.get_target_icc_profile(
-            instance_extensions
-        )
-        patch_required_to_be_fully_in_source_image = (
-            patch_coordinate_module.patch_required_to_be_fully_in_source_image(
-                instance_extensions
-            )
-        )
-        resize_image_dimensions = (
-            image_dimension_utils.get_resize_image_dimensions(
-                instance_extensions
-            )
-        )
-        yield from decode_dicom_image(
-            dcm,
-            target_icc_profile,
-            instance_patch_coordinates,
-            resize_image_dimensions,
-            patch_required_to_be_fully_in_source_image,
+    return _generate_acquisition_images(
+        abstract_handler.get_base_request_extensions(base_request),
+        instance_patch_coordinates,
+        _modality_norm(
             self._modality_default_image_transform,
-        )
-    except pydicom.errors.InvalidDicomError:
-      # The handler is purposefully eating the message here.
-      # if a handler fails to process the image it returns an empty iterator.
-      return
+            _decode_dicom_images(
+                base_request,
+                file_paths,
+                raise_error_if_invalid_dicom=self._raise_error_if_invalid_dicom,
+            ),
+        ),
+    )

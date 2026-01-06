@@ -16,7 +16,7 @@
 
 import dataclasses
 import json
-from typing import Any, List, Mapping
+from typing import Any, Mapping, Sequence
 
 from ez_wsi_dicomweb import credential_factory as credential_factory_module
 from ez_wsi_dicomweb import dicom_web_interface
@@ -28,6 +28,7 @@ from data_accessors.utils import data_accessor_definition_utils
 from data_accessors.utils import json_validation_utils
 from data_accessors.utils import patch_coordinate as patch_coordinate_module
 
+
 _InstanceJsonKeys = data_accessor_const.InstanceJsonKeys
 _PRESENT = 'PRESENT'
 
@@ -35,10 +36,10 @@ _PRESENT = 'PRESENT'
 @dataclasses.dataclass(frozen=True)
 class DicomGenericImage:
   credential_factory: credential_factory_module.AbstractCredentialFactory
-  instance_path: str
+  dicomweb_paths: Sequence[dicom_path.Path]
   base_request: Mapping[str, Any]
-  patch_coordinates: List[patch_coordinate_module.PatchCoordinate]
-  dicom_instances_metadata: List[dicom_web_interface.DicomObject]
+  patch_coordinates: Sequence[patch_coordinate_module.PatchCoordinate]
+  dicom_instances_metadata: Sequence[dicom_web_interface.DicomObject]
 
 
 def _generate_instance_metadata_error_string(
@@ -66,7 +67,7 @@ def json_to_generic_dicom_image(
     default_patch_width: int,
     default_patch_height: int,
     require_patch_dim_match_default_dim: bool,
-    dicom_instances_metadata: List[dicom_web_interface.DicomObject],
+    dicom_instances_metadata: Sequence[dicom_web_interface.DicomObject],
 ) -> DicomGenericImage:
   """Converts json to DicomGenericImage."""
   try:
@@ -85,20 +86,11 @@ def json_to_generic_dicom_image(
         f'Invalid patch coordinate; {exp}; {instance_error_msg}'
     ) from exp
 
-  instance_paths = data_accessor_definition_utils.parse_dicom_source(instance)
-  if any(i.type != dicom_path.Type.INSTANCE for i in instance_paths):
-    raise data_accessor_errors.InvalidRequestFieldError(
-        f'Unsupported DICOM source "{instance_paths}". Required to define a'
-        ' DICOM SOP Instance.'
-    )
-  if len(instance_paths) > 1:
-    raise data_accessor_errors.InvalidRequestFieldError(
-        'Unsupported DICOM source does not support multiple instances.'
-    )
+  dicomweb_paths = data_accessor_definition_utils.parse_dicom_source(instance)
   try:
     return DicomGenericImage(
         credential_factory=credential_factory,
-        instance_path=instance_paths[0].complete_url,
+        dicomweb_paths=dicomweb_paths,
         base_request=instance,
         patch_coordinates=patch_coordinates,
         dicom_instances_metadata=dicom_instances_metadata,
