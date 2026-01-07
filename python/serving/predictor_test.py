@@ -30,6 +30,7 @@ import pydicom
 import requests_mock
 
 from data_accessors import data_accessor_errors
+from data_accessors.utils import test_utils
 from serving.serving_framework import model_runner
 from serving import predictor
 from ez_wsi_dicomweb.test_utils.dicom_store_mock import dicom_store_mock
@@ -114,27 +115,27 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       dict(
           testcase_name='one_pixel',
           input_image_shape=(1, 1, 3),
-          expected_image_input=b'average_byte_value: 255.0, byte_length: 3',
+          expected_image_input='average_byte_value: 255.0, byte_length: 3',
       ),
       dict(
           testcase_name='square',
           input_image_shape=(4, 4, 3),
-          expected_image_input=b'average_byte_value: 255.0, byte_length: 48',
+          expected_image_input='average_byte_value: 255.0, byte_length: 48',
       ),
       dict(
           testcase_name='large_square',
           input_image_shape=(100, 100, 3),
-          expected_image_input=b'average_byte_value: 255.0, byte_length: 30000',
+          expected_image_input='average_byte_value: 255.0, byte_length: 30000',
       ),
       dict(
           testcase_name='tall',
           input_image_shape=(100, 1, 3),
-          expected_image_input=b'average_byte_value: 2.55, byte_length: 30000',
+          expected_image_input='average_byte_value: 2.55, byte_length: 30000',
       ),
       dict(
           testcase_name='wide',
           input_image_shape=(1, 50, 3),
-          expected_image_input=b'average_byte_value: 5.1, byte_length: 7500',
+          expected_image_input='average_byte_value: 5.1, byte_length: 7500',
       ),
   )
   # make image compression a pass through to improve testing transparency.
@@ -187,17 +188,17 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
       dict(
           testcase_name='png',
           image_input_compression_format='png',
-          expected_image_input=b'average_byte_value: 61.83, byte_length: 69',
+          expected_image_input='average_byte_value: 61.83, byte_length: 69',
       ),
       dict(
           testcase_name='jpeg',
           image_input_compression_format='jpeg',
-          expected_image_input=b'average_byte_value: 77.83, byte_length: 631',
+          expected_image_input='average_byte_value: 77.83, byte_length: 631',
       ),
       dict(
           testcase_name='jpg',
           image_input_compression_format='jpg',
-          expected_image_input=b'average_byte_value: 77.83, byte_length: 631',
+          expected_image_input='average_byte_value: 77.83, byte_length: 631',
       ),
   )
   def test_image_compression(
@@ -756,6 +757,384 @@ class ImageEncoderTest(parameterized.TestCase):
         predictor._get_local_file_handlers(),
         predictor._get_local_file_handlers(),
     )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='ct',
+          mock_modality='CT',
+      ),
+      dict(
+          testcase_name='mri',
+          mock_modality='MR',
+      ),
+  )
+  def test_radiology_volume_images_with_more_than_one_slice_include_slice_prompt(
+      self, mock_modality
+  ):
+    temp_dir = self.create_tempdir().full_path
+    dcm_files = []
+    for i in range(2):
+      path = test_utils.testdata_path('ct', 'test_series', f'image{i}.dcm')
+      filename = os.path.basename(path)
+      with pydicom.dcmread(path) as dcm:
+        dcm.Modality = mock_modality
+        dcm.save_as(os.path.join(temp_dir, filename))
+      dcm_files.append(f'gs://earth/{filename}')
+    with gcs_mock.GcsMock({'earth': temp_dir}):
+      pred = predictor.MedGemmaPredictor(
+          prompt_converter=_mock_prompt_converter
+      )
+      mock_model_runner = mock.create_autospec(
+          model_runner.ModelRunner, instance=True
+      )
+      mock_model_runner.run_model_multiple_output.return_value = {
+          'text_output': np.array([b'test_output']),
+          'num_input_tokens': np.array(42),
+          'num_output_tokens': np.array(3),
+      }
+      mock_prediction_input = {
+          'messages': [
+              {
+                  'role': 'user',
+                  'content': [
+                      {
+                          'type': 'text',
+                          'text': 'Describe the following scan volume.',
+                      },
+                      {
+                          'type': 'image_gcs',
+                          'image_gcs': {'gcs_source': dcm_files},
+                      },
+                      {
+                          'type': 'text',
+                          'text': 'Be clear and concise.',
+                      },
+                  ],
+              },
+          ],
+          'max_tokens': 500,
+          'temperature': 0,
+      }
+      pred.predict(mock_prediction_input, mock_model_runner)
+      model_text_input = mock_model_runner.run_model_multiple_output.call_args[
+          1
+      ]['model_input']['text_input']
+      self.assertEqual(
+          model_text_input,
+          [
+              b'[{"role": "user", "content": [{"type": "text", "text":'
+              b' "Describe the following scan volume."}, {"type": "image",'
+              b' "image_gcs": {"gcs_source": ["gs://earth/image0.dcm",'
+              b' "gs://earth/image1.dcm"]}}, {"type": "text", "text": "SLICE'
+              b' 1"}, {"type": "image", "image_gcs": {"gcs_source":'
+              b' ["gs://earth/image0.dcm", "gs://earth/image1.dcm"]}}, {"type":'
+              b' "text", "text": "SLICE 2"}, {"type": "text", "text": "Be clear'
+              b' and concise."}]}]'
+          ],
+      )
+      model_input_images = (
+          mock_model_runner.run_model_multiple_output.call_args[1][
+              'model_input'
+          ]['image']
+      )
+      self.assertLen(model_input_images, 2)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='ct',
+          mock_modality='CT',
+      ),
+      dict(
+          testcase_name='mri',
+          mock_modality='MR',
+      ),
+  )
+  def test_radiology_volume_images_define_single_excludes_index_prompt(
+      self, mock_modality
+  ):
+    temp_dir = self.create_tempdir().full_path
+    dcm_files = []
+    path = test_utils.testdata_path('ct', 'test_series', f'image{0}.dcm')
+    filename = os.path.basename(path)
+    with pydicom.dcmread(path) as dcm:
+      dcm.Modality = mock_modality
+      dcm.save_as(os.path.join(temp_dir, filename))
+    dcm_files.append(f'gs://earth/{filename}')
+    with gcs_mock.GcsMock({'earth': temp_dir}):
+      pred = predictor.MedGemmaPredictor(
+          prompt_converter=_mock_prompt_converter
+      )
+      mock_model_runner = mock.create_autospec(
+          model_runner.ModelRunner, instance=True
+      )
+      mock_model_runner.run_model_multiple_output.return_value = {
+          'text_output': np.array([b'test_output']),
+          'num_input_tokens': np.array(42),
+          'num_output_tokens': np.array(3),
+      }
+      mock_prediction_input = {
+          'messages': [
+              {
+                  'role': 'user',
+                  'content': [
+                      {
+                          'type': 'text',
+                          'text': 'Describe the following scan volume.',
+                      },
+                      {
+                          'type': 'image_gcs',
+                          'image_gcs': {'gcs_source': dcm_files},
+                      },
+                      {
+                          'type': 'text',
+                          'text': 'Be clear and concise.',
+                      },
+                  ],
+              },
+          ],
+          'max_tokens': 500,
+          'temperature': 0,
+      }
+      pred.predict(mock_prediction_input, mock_model_runner)
+      model_text_input = mock_model_runner.run_model_multiple_output.call_args[
+          1
+      ]['model_input']['text_input']
+      self.assertEqual(
+          model_text_input,
+          [
+              b'[{"role": "user", "content": [{"type": "text", "text":'
+              b' "Describe the following scan volume."}, {"type": "image",'
+              b' "image_gcs": {"gcs_source": ["gs://earth/image0.dcm"]}},'
+              b' {"type": "text", "text": "Be clear and concise."}]}]'
+          ],
+      )
+      model_input_images = (
+          mock_model_runner.run_model_multiple_output.call_args[1][
+              'model_input'
+          ]['image']
+      )
+      self.assertLen(model_input_images, 1)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='ct',
+          mock_modality='CT',
+      ),
+      dict(
+          testcase_name='mri',
+          mock_modality='MR',
+      ),
+  )
+  def test_radiology_series_volume_prediction_with_multiple_slices_includes_slice_prompt(
+      self, mock_modality
+  ):
+    with dicom_store_mock.MockDicomStores(_MOCK_STORE_PATH) as dicom_store:
+      for index in range(2):
+        path = test_utils.testdata_path(
+            'ct', 'test_series', f'image{index}.dcm'
+        )
+        with pydicom.dcmread(path) as dcm:
+          dcm.Modality = mock_modality
+          dicom_store[_MOCK_STORE_PATH].add_instance(dcm)
+          series_path = f'{_MOCK_STORE_PATH}/studies/{dcm.StudyInstanceUID}/series/{dcm.SeriesInstanceUID}'
+      mock_prediction_input = {
+          'messages': [{
+              'role': 'system',
+              'content': [
+                  {
+                      'type': 'text',
+                      'text': 'Describe the following scan volume.',
+                  },
+                  {
+                      'type': 'image_dicom',
+                      'image_dicom': {
+                          'dicom_source': series_path,
+                      },
+                  },
+                  {
+                      'type': 'text',
+                      'text': 'Be clear and concise.',
+                  },
+              ],
+          }],
+          'max_tokens': 500,
+          'temperature': 0,
+      }
+      pred = predictor.MedGemmaPredictor(
+          prompt_converter=_mock_prompt_converter
+      )
+      mock_model_runner = mock.create_autospec(
+          model_runner.ModelRunner, instance=True
+      )
+      mock_model_runner.run_model_multiple_output.return_value = {
+          'text_output': np.array([b'test_output']),
+          'num_input_tokens': np.array(42),
+          'num_output_tokens': np.array(3),
+      }
+      pred.predict(mock_prediction_input, mock_model_runner)
+      model_text_input = mock_model_runner.run_model_multiple_output.call_args[
+          1
+      ]['model_input']['text_input']
+      self.assertEqual(
+          model_text_input,
+          [
+              b'[{"role": "system", "content": [{"type": "text", "text":'
+              b' "Describe the following scan volume."}, {"type": "image",'
+              b' "image_dicom": {"dicom_source":'
+              b' "https://test_store/studies/1.2.3.4.5.6/series/1.2.3.4.5.7"}},'
+              b' {"type": "text", "text": "SLICE 1"}, {"type": "image",'
+              b' "image_dicom": {"dicom_source":'
+              b' "https://test_store/studies/1.2.3.4.5.6/series/1.2.3.4.5.7"}},'
+              b' {"type": "text", "text": "SLICE 2"}, {"type": "text", "text":'
+              b' "Be clear and concise."}]}]'
+          ],
+      )
+      model_input_images = (
+          mock_model_runner.run_model_multiple_output.call_args[1][
+              'model_input'
+          ]['image']
+      )
+      self.assertLen(model_input_images, 2)
+
+  def test_dicom_pathology_prompt_via_dicom_series(
+      self,
+  ):
+    with dicom_store_mock.MockDicomStores(_MOCK_STORE_PATH) as dicom_store:
+      path = test_utils.testdata_path(
+          'wsi', 'multiframe_camelyon_challenge_image.dcm'
+      )
+      with pydicom.dcmread(path) as dcm:
+        dicom_store[_MOCK_STORE_PATH].add_instance(dcm)
+        series_path = f'{_MOCK_STORE_PATH}/studies/{dcm.StudyInstanceUID}/series/{dcm.SeriesInstanceUID}'
+      mock_prediction_input = {
+          'messages': [{
+              'role': 'system',
+              'content': [
+                  {
+                      'type': 'text',
+                      'text': 'Describe the following pathology slide.',
+                  },
+                  {
+                      'type': 'image_dicom',
+                      'image_dicom': {
+                          'dicom_source': series_path,
+                      },
+                  },
+                  {
+                      'type': 'text',
+                      'text': 'Be clear and concise.',
+                  },
+              ],
+          }],
+          'max_tokens': 500,
+          'temperature': 0,
+      }
+      pred = predictor.MedGemmaPredictor(
+          prompt_converter=_mock_prompt_converter
+      )
+      mock_model_runner = mock.create_autospec(
+          model_runner.ModelRunner, instance=True
+      )
+      mock_model_runner.run_model_multiple_output.return_value = {
+          'text_output': np.array([b'test_output']),
+          'num_input_tokens': np.array(42),
+          'num_output_tokens': np.array(3),
+      }
+      pred.predict(mock_prediction_input, mock_model_runner)
+      model_text_input = mock_model_runner.run_model_multiple_output.call_args[
+          1
+      ]['model_input']['text_input']
+      model_input_images = (
+          mock_model_runner.run_model_multiple_output.call_args[1][
+              'model_input'
+          ]['image']
+      )
+      self.assertEqual(
+          model_text_input,
+          [
+              b'[{"role": "system", "content": [{"type": "text", "text":'
+              b' "Describe the following pathology slide."}, {"type": "image",'
+              b' "image_dicom": {"dicom_source":'
+              b' "https://test_store/studies/1.3.6.1.4.1.11129.5.7.999.18649109954048068.740.1688792381777315/series/1.3.6.1.4.1.11129.5.7.0.1.517182092386.24422120.1688792467737634"}},'
+              b' {"type": "text", "text": "Be clear and concise."}]}]'
+          ],
+      )
+      self.assertLen(model_input_images, 1)
+
+  def test_dicom_pathology_prompt_via_dicom_series_has_multiple_patches(
+      self,
+  ):
+    with dicom_store_mock.MockDicomStores(_MOCK_STORE_PATH) as dicom_store:
+      path = test_utils.testdata_path(
+          'wsi', 'multiframe_camelyon_challenge_image.dcm'
+      )
+      with pydicom.dcmread(path) as dcm:
+        dicom_store[_MOCK_STORE_PATH].add_instance(dcm)
+        series_path = f'{_MOCK_STORE_PATH}/studies/{dcm.StudyInstanceUID}/series/{dcm.SeriesInstanceUID}'
+      mock_prediction_input = {
+          'messages': [{
+              'role': 'system',
+              'content': [
+                  {
+                      'type': 'text',
+                      'text': 'Describe the following pathology slide.',
+                  },
+                  {
+                      'type': 'image_dicom',
+                      'image_dicom': {
+                          'dicom_source': series_path,
+                          'patch_coordinates_list': [_pc(2, 2), _pc(3, 3)],
+                      },
+                  },
+                  {
+                      'type': 'text',
+                      'text': 'Be clear and concise.',
+                  },
+              ],
+          }],
+          'max_tokens': 500,
+          'temperature': 0,
+      }
+      pred = predictor.MedGemmaPredictor(
+          prompt_converter=_mock_prompt_converter
+      )
+      mock_model_runner = mock.create_autospec(
+          model_runner.ModelRunner, instance=True
+      )
+      mock_model_runner.run_model_multiple_output.return_value = {
+          'text_output': np.array([b'test_output']),
+          'num_input_tokens': np.array(42),
+          'num_output_tokens': np.array(3),
+      }
+      pred.predict(mock_prediction_input, mock_model_runner)
+      model_text_input = mock_model_runner.run_model_multiple_output.call_args[
+          1
+      ]['model_input']['text_input']
+      model_input_images = (
+          mock_model_runner.run_model_multiple_output.call_args[1][
+              'model_input'
+          ]['image']
+      )
+      self.assertEqual(
+          model_text_input,
+          [
+              b'[{"role": "system", "content": [{"type": "text", "text":'
+              b' "Describe the following pathology slide."}, {"type": "image",'
+              b' "image_dicom": {"dicom_source":'
+              b' "https://test_store/studies/1.3.6.1.4.1.11129.5.7.999.18649109954048068.740.1688792381777315/series/1.3.6.1.4.1.11129.5.7.0.1.517182092386.24422120.1688792467737634",'
+              b' "patch_coordinates_list": [{"x_origin": 2, "y_origin": 2,'
+              b' "width": 224, "height": 224}, {"x_origin": 3, "y_origin": 3,'
+              b' "width": 224, "height": 224}]}}, {"type": "image",'
+              b' "image_dicom": {"dicom_source":'
+              b' "https://test_store/studies/1.3.6.1.4.1.11129.5.7.999.18649109954048068.740.1688792381777315/series/1.3.6.1.4.1.11129.5.7.0.1.517182092386.24422120.1688792467737634",'
+              b' "patch_coordinates_list": [{"x_origin": 2, "y_origin": 2,'
+              b' "width": 224, "height": 224}, {"x_origin": 3, "y_origin": 3,'
+              b' "width": 224, "height": 224}]}}, {"type": "text", "text": "Be'
+              b' clear and concise."}]}]'
+          ],
+      )
+      self.assertLen(model_input_images, 2)
+
 
 if __name__ == '__main__':
   absltest.main()

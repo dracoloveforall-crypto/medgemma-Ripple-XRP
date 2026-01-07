@@ -19,9 +19,9 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import contextlib
+import copy
 import dataclasses
 import functools
-import json
 import time
 import typing
 from typing import Any, Callable, Mapping, Optional, Sequence, Union
@@ -62,6 +62,16 @@ from serving.logging_lib import cloud_logging_client
 
 INSTANCES_KEY = 'instances'
 PREDICTIONS_KEY = 'predictions'
+
+_DICOM_CT_OR_MRI_VOLUME_DATA_SOURCES = (
+    abstract_data_accessor.AccessorDataSource.DICOM_CT_VOLUME,
+    abstract_data_accessor.AccessorDataSource.DICOM_MRI_VOLUME,
+)
+_MESSAGE_CONTENT_ENTRY_TYPE_REMAP = {
+    img_type: 'image' for img_type in predictor_const.IMAGE_INPUT_TYPES
+} | {
+    predictor_const.TEXT_INPUT_TYPE: 'text',
+}
 
 
 class _InlineTextInstance(inline_text_data_accessor_definition.InlineText):
@@ -234,9 +244,9 @@ def _parse_image_content(
   )
 
 
-def _base64_encode_image_bytes(image_bytes: bytes) -> str:
+def _base64_encode_image_bytes(image_bytes: bytes) -> bytes:
   """Mockable target for testing."""
-  return base64.b64encode(image_bytes).decode('utf-8')
+  return base64.b64encode(image_bytes)
 
 
 def _zero_pad_image_to_square(norm_img: np.ndarray) -> np.ndarray:
@@ -270,8 +280,8 @@ def _compress_image(image_bytes: np.ndarray) -> bytes:
   )
 
 
-def _encode_image_bytes(image_bytes: np.ndarray) -> str:
-  """Encodes uncompressed image bytes as a base64 string."""
+def _encode_image_bytes(image_bytes: np.ndarray) -> bytes:
+  """Encodes uncompressed image bytes as a base64 bytes."""
   # convert to 8 bit image
   if image_bytes.dtype != np.uint8:
     sf = np.iinfo(image_bytes.dtype).max / np.iinfo(np.uint8).max
@@ -327,27 +337,6 @@ class _MedGemmaContent:
   def __post_init__(self):
     if self.content is None:
       raise ValueError('MedGemmaContent content is None.')
-
-  @property
-  def med_gemma_content_input(self) -> Sequence[np.ndarray]:
-    """MedGemma content formatted input."""
-    if isinstance(self.content, inline_text_data_accessor.InlineText):
-      # TODO: Clean up
-      raise NotImplementedError('Text input is not treated as content.')
-    return [typing.cast(np.ndarray, i) for i in self.content.data_iterator()]
-
-
-@dataclasses.dataclass(frozen=True)
-class _MedGemmaMessage:
-  role: str
-  content: Sequence[_MedGemmaContent]
-
-  @property
-  def med_gemma_message_input(self) -> str:
-    content_list = []
-    for c in self.content:
-      content_list.extend(c.med_gemma_content_input)
-    return json.dumps({'role': self.role, 'content': content_list})
 
 
 def _parse_text_content(
@@ -470,80 +459,121 @@ class _MedGemmaPredictionParameters:
     }
 
 
+def _dicom_ct_or_mri_volume_slice_index_text_entry(
+    slice_index: int,
+) -> Mapping[str, Any]:
+  return {
+      'type': 'text',
+      'text': f'SLICE {slice_index}',
+  }
+
+
 @dataclasses.dataclass(frozen=True)
 class _MedGemmaPredictionRequest:
   """MedGemma model input."""
 
-  prompt: str
+  messages: Sequence[dict[str, Any]]
   content: Sequence[_MedGemmaContent]
   parameters: _MedGemmaPredictionParameters
+  add_generation_prompt: bool
 
-  @property
-  def model_input(self) -> Mapping[str, np.ndarray]:
+  def model_input(
+      self,
+      prompt_converter: Callable[[list[dict[str, Any]], dict[str, Any]], str],
+  ) -> Mapping[str, np.ndarray]:
     """Model input for prediction."""
     images = []
-    for c in self.content:
-      images.extend(c.med_gemma_content_input)
+    revised_msgs = []
+    image_content_index = 0
+    for message in self.messages:
+      if 'content' not in message or isinstance(message['content'], str):
+        revised_msgs.append(message)
+        continue
+      revised_content = []
+      for entry in message['content']:
+        entry_type = entry['type']
+        if entry_type not in predictor_const.IMAGE_INPUT_TYPES:
+          revised_content.append(entry)
+          continue
+        entry = copy.copy(entry)
+        entry['type'] = _MESSAGE_CONTENT_ENTRY_TYPE_REMAP.get(
+            entry_type, entry_type
+        )
+        image_content = self.content[image_content_index]
+        image_content_index += 1
+        for data_source in image_content.content.data_acquisition_iterator():
+          acquision_data_source = data_source.acquision_data_source
+          if acquision_data_source not in _DICOM_CT_OR_MRI_VOLUME_DATA_SOURCES:
+            for img in data_source.acquision_data_source_iterator:
+              images.append(_encode_image_bytes(img))
+              revised_content.append(entry)
+            continue
+          for slice_index, img in enumerate(
+              data_source.acquision_data_source_iterator, 1
+          ):
+            if slice_index == 2:
+              # add indicator for 1st slice if there are at least 2 slices.
+              revised_content.append(
+                  _dicom_ct_or_mri_volume_slice_index_text_entry(1)
+              )
+            images.append(_encode_image_bytes(img))
+            revised_content.append(entry)
+            if slice_index == 1:
+              continue
+            # automatically inject slice index prompts for DICOM CT and MRI
+            # volume data sources if there is more than 1 slice.
+            revised_content.append(
+                _dicom_ct_or_mri_volume_slice_index_text_entry(slice_index)
+            )
+      message = copy.copy(message)
+      message['content'] = revised_content
+      revised_msgs.append(message)
+    prompt = prompt_converter(
+        revised_msgs,
+        {'add_generation_prompt': self.add_generation_prompt},
+    )
     input_map = {
-        'text_input': np.array([self.prompt.encode('utf-8')], dtype=np.object_),
+        'text_input': np.array([prompt.encode('utf-8')], dtype=np.object_),
         'exclude_input_in_output': np.ndarray([1], dtype=np.bool_),
         'return_num_input_tokens': np.ndarray([1], dtype=np.bool_),
         'return_num_output_tokens': np.ndarray([1], dtype=np.bool_),
     }
     if images:
-      input_map['image'] = np.array(
-          [_encode_image_bytes(image).encode('utf-8') for image in images],
-          dtype=np.object_,
-      )
+      input_map['image'] = np.array(images, dtype=np.object_)
     return input_map
 
 
-class _PredictionInputParser:
-  """Class containing methods for transforming embedding request and responses."""
+def prediction_input_json_to_embedding_request(
+    config: dicom_wsi_configuration.ConfigurationSettings,
+    json_metadata: Mapping[str, Any],
+) -> _MedGemmaPredictionRequest:
+  """Converts json to embedding request.
 
-  def __init__(
-      self,
-      prompt_converter: Callable[[list[dict[str, Any]], dict[str, Any]], str],
-  ):
-    self._prompt_converter = prompt_converter
+  Args:
+    config: The configuration settings for the data source.
+    json_metadata: The value of the JSON payload provided to the API.
 
-  def json_to_embedding_request(
-      self,
-      config: dicom_wsi_configuration.ConfigurationSettings,
-      json_metadata: Mapping[str, Any],
-  ) -> _MedGemmaPredictionRequest:
-    """Converts json to embedding request.
+  Returns:
+    Structured EmbeddingRequest object.
 
-    Args:
-      config: The configuration settings for the data source.
-      json_metadata: The value of the JSON payload provided to the API.
-
-    Returns:
-      Structured EmbeddingRequest object.
-
-    Raises:
-      InvalidRequestFieldError: If the provided fields are invalid.
-    """
-    json_validation_utils.validate_str_key_dict(json_metadata)
-    try:
-      parameters = _MedGemmaPredictionParameters.from_json(json_metadata)
-      messages = json_validation_utils.validate_list(
-          json_metadata.get('messages', None)
-      )
-      content = _parse_all_content(config, messages)
-      prompt = self._prompt_converter(
-          messages,
-          {
-              'add_generation_prompt': json_metadata.get(
-                  'add_generation_prompt', True
-              )
-          },
-      )
-    except json_validation_utils.ValidationError as e:
-      raise data_accessor_errors.InvalidRequestFieldError(
-          f'Invalid request field: {e}'
-      ) from e
-    return _MedGemmaPredictionRequest(prompt, content, parameters)
+  Raises:
+    InvalidRequestFieldError: If the provided fields are invalid.
+  """
+  json_validation_utils.validate_str_key_dict(json_metadata)
+  try:
+    parameters = _MedGemmaPredictionParameters.from_json(json_metadata)
+    messages = json_validation_utils.validate_list(
+        json_metadata.get('messages', None)
+    )
+    content = _parse_all_content(config, messages)
+  except json_validation_utils.ValidationError as e:
+    raise data_accessor_errors.InvalidRequestFieldError(
+        f'Invalid request field: {e}'
+    ) from e
+  add_generation_prompt = json_metadata.get('add_generation_prompt', True)
+  return _MedGemmaPredictionRequest(
+      messages, content, parameters, add_generation_prompt
+  )
 
 
 def _validate_instance_list(json_metadata: Mapping[str, Any]) -> Sequence[Any]:
@@ -609,12 +639,10 @@ class _ModelPredictor:
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=self._threadpool_max_workers,
     ) as thread_pool:
-      results = list(
-          thread_pool.map(
-              functools.partial(_get_inst_data_map_func, stack),
-              med_gemma_content,
-              timeout=self._thread_pool_timeout,
-          )
+      results = thread_pool.map(
+          functools.partial(_get_inst_data_map_func, stack),
+          med_gemma_content,
+          timeout=self._thread_pool_timeout,
       )
     return [r for r in results if r is not None]
 
@@ -640,7 +668,7 @@ class _ModelPredictor:
       # model execution parameters
       # call medgemma and return response.
       result = model.run_model_multiple_output(
-          model_input=request.model_input,
+          model_input=request.model_input(self._prompt_converter),
           parameters=request.parameters.to_dict(),
           model_output_keys={
               'text_output',
@@ -743,9 +771,9 @@ class MedGemmaPredictor:
         ),
     )
     try:
-      med_gemma_predictionrequest = _PredictionInputParser(
-          self._prompt_converter
-      ).json_to_embedding_request(config, prediction_input)
+      med_gemma_predictionrequest = prediction_input_json_to_embedding_request(
+          config, prediction_input
+      )
     except data_accessor_errors.DataAccessorError as exp:
       return dict(_prediction_error_response(exp))
 

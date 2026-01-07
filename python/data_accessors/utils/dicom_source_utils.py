@@ -17,7 +17,7 @@
 import collections
 import dataclasses
 import enum
-from typing import Any, List, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from ez_wsi_dicomweb import credential_factory
 from ez_wsi_dicomweb import dicom_web_interface
@@ -210,7 +210,7 @@ def _sort_by_slice_position(obj: dicom_web_interface.DicomObject) -> int:
     return obj.get_list_value(tags.IMAGE_POSITION_PATIENT)[
         img_pos_pat_zcoord_index
     ]
-  except IndexError:
+  except (IndexError, TypeError):
     return 0
 
 

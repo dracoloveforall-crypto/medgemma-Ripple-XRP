@@ -21,7 +21,6 @@ instance to handle the model.
 """
 
 from collections.abc import Sequence
-import copy
 import os
 import pathlib
 from typing import Any
@@ -30,16 +29,14 @@ from absl import app
 from absl import flags
 from absl import logging
 import jsonschema
-import yaml
 import transformers
+import yaml
 
-from data_accessors import data_accessor_const
 from serving.serving_framework import inline_prediction_executor
 from serving.serving_framework import server_gunicorn
 from serving.serving_framework.triton import server_health_check
 from serving.serving_framework.triton import triton_streaming_server_model_runner
 from serving import predictor
-from serving import predictor_const
 
 LOCAL_MODEL_PATH_FLAG = flags.DEFINE_string(
     'local_model_path',
@@ -96,32 +93,8 @@ def main(argv: Sequence[str]) -> None:
   def to_prompt(
       conversation: list[dict[str, Any]], params: dict[str, Any]
   ) -> str:
-    """Generates a prompt from a conversation without modifying the original."""
-    type_map = {
-        img_type: 'image' for img_type in predictor_const.IMAGE_INPUT_TYPES
-    } | {
-        predictor_const.TEXT_INPUT_TYPE: 'text',
-    }
-    patch_key = data_accessor_const.InstanceJsonKeys.PATCH_COORDINATES
-    revised = [copy.copy(message) for message in conversation]
-    for message in revised:
-      if 'content' in message:
-        if isinstance(message['content'], str):
-          continue
-        revised_content = []
-        for entry in message['content']:
-          entry = copy.copy(entry)
-          revised_content.append(entry)
-          if entry['type'] in predictor_const.IMAGE_INPUT_TYPES:
-            image_structure = entry[entry['type']]
-            if patch_key in image_structure:
-              revised_content.extend(
-                  [entry] * (len(image_structure[patch_key]) - 1)
-              )
-          entry['type'] = type_map.get(entry['type'], entry['type'])
-        message['content'] = revised_content
-
-    return processor.apply_chat_template(revised, tokenize=False, **params)
+    """Transform chat message into model input."""
+    return processor.apply_chat_template(conversation, tokenize=False, **params)
 
   predictor_instance = predictor.MedGemmaPredictor(
       prompt_converter=to_prompt,
