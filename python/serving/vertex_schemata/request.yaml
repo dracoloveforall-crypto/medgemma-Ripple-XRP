@@ -356,9 +356,17 @@ components:
       additionalProperties: false
       properties:
         url:
-          type: string
-          pattern: ^(https?://.+|\s*data\s*:\s*image/(png|jpeg|jpg|gif)\s*;\s*base64\s*,.+)$
-          title: Url
+          oneOf:
+            - type: string
+            pattern: ^(https?://.+|\s*data\s*:\s*image/(png|jpeg|jpg|gif)\s*;\s*base64\s*,.+)$
+            title: SingleUrl
+            - type: array
+            title: UrlList
+            minItems: 2
+              description: List of URLS to images.
+              items:
+                type: string
+                pattern: ^(https?://.+|\s*data\s*:\s*image/(png|jpeg|jpg|gif)\s*;\s*base64\s*,.+)$
         access_credential:
           type: string
           pattern: ^(application_default|[a-zA-Z0-9_\-.]+)$
