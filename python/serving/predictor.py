@@ -252,7 +252,11 @@ def _parse_image_content(
       auth = authentication_utils.create_auth_from_instance(
           dicom_record.get(predictor_const.BEARER_TOKEN, '')
       )
-      result = dicom_source_utils.get_dicom_source_type(auth, dicom_record)
+      result = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
+          auth,
+          dicom_record,
+          flags.MAX_NUMBER_OF_SLICES_IN_RADIOLOGY_VOLUME_FLAG.value,
+      )
       # if slide microscope image
       if (
           result.dicom_source_type

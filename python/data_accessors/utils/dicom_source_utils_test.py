@@ -26,6 +26,7 @@ from data_accessors.utils import test_utils
 from ez_wsi_dicomweb.test_utils.dicom_store_mock import dicom_store_mock
 
 
+_NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES = -1
 _InstanceJsonKeys = data_accessor_const.InstanceJsonKeys
 _MOCK_DICOM_STORE_PATH = 'https://www.mock_dicom_store.com'
 
@@ -53,11 +54,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           _MOCK_DICOM_STORE_PATH
       ) as dicom_store:
         dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-        source_type = dicom_source_utils.get_dicom_source_type(
-            credential_factory.NoAuthCredentialsFactory(),
-            {
-                _InstanceJsonKeys.DICOM_WEB_URI: dcm_path,
-            },
+        source_type = (
+            dicom_source_utils.get_dicom_source_type_and_instance_metadata(
+                credential_factory.NoAuthCredentialsFactory(),
+                {
+                    _InstanceJsonKeys.DICOM_WEB_URI: dcm_path,
+                },
+                _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
+            )
         )
         self.assertEqual(source_type.dicom_source_type, expected_source_type)
         self.assertLen(source_type.dicom_instances_metadata, 1)
@@ -114,11 +118,12 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           dcm.SeriesInstanceUID = '1.2'
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
       with self.assertRaises(data_accessor_errors.InvalidRequestFieldError):
-        dicom_source_utils.get_dicom_source_type(
+        dicom_source_utils.get_dicom_source_type_and_instance_metadata(
             credential_factory.NoAuthCredentialsFactory(),
             {
                 _InstanceJsonKeys.DICOM_WEB_URI: dcm_path,
             },
+            _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
         )
 
   def test_identify_source_with_no_identify_multiple_modalities_raises(self):
@@ -139,11 +144,12 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           dcm.SOPClassUID = '1.2.840.10008.5.1.4.1.1.6.2'
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
       with self.assertRaises(data_accessor_errors.InvalidRequestFieldError):
-        dicom_source_utils.get_dicom_source_type(
+        dicom_source_utils.get_dicom_source_type_and_instance_metadata(
             credential_factory.NoAuthCredentialsFactory(),
             {
                 _InstanceJsonKeys.DICOM_WEB_URI: dcm_path,
             },
+            _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
         )
 
   def test_sm_series_with_wsi_and_non_wsi_instances_raises(self):
@@ -170,11 +176,12 @@ class DicomSourceUtilsTest(parameterized.TestCase):
         dcm.SOPClassUID = '1.2.840.10008.5.1.4.1.1.77.1.3'
         dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
       with self.assertRaises(data_accessor_errors.InvalidRequestFieldError):
-        dicom_source_utils.get_dicom_source_type(
+        dicom_source_utils.get_dicom_source_type_and_instance_metadata(
             credential_factory.NoAuthCredentialsFactory(),
             {
                 _InstanceJsonKeys.DICOM_WEB_URI: dcm_path,
             },
+            _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
         )
 
   def test_definintion_of_unsupported_instances_raises(self):
@@ -208,11 +215,12 @@ class DicomSourceUtilsTest(parameterized.TestCase):
         )
         dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
       with self.assertRaises(data_accessor_errors.InvalidRequestFieldError):
-        dicom_source_utils.get_dicom_source_type(
+        dicom_source_utils.get_dicom_source_type_and_instance_metadata(
             credential_factory.NoAuthCredentialsFactory(),
             {
                 _InstanceJsonKeys.DICOM_SOURCE: dcm_path,
             },
+            _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
         )
 
   def test_filter_out_unspecified_sop_instances(self):
@@ -241,11 +249,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
         dcm.SeriesInstanceUID = '1.2'
         dcm.SOPInstanceUID = '1.2.3'
         dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
-          credential_factory.NoAuthCredentialsFactory(),
-          {
-              _InstanceJsonKeys.DICOM_SOURCE: dcm_path,
-          },
+      source_type = (
+          dicom_source_utils.get_dicom_source_type_and_instance_metadata(
+              credential_factory.NoAuthCredentialsFactory(),
+              {
+                  _InstanceJsonKeys.DICOM_SOURCE: dcm_path,
+              },
+              _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
+          )
       )
     self.assertEqual(
         source_type.dicom_source_type,
@@ -287,11 +298,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
         dcm.ConcatenationUID = '1.2.3.4'
         expected_sop_instance_uid.add(dcm.SOPInstanceUID)
         dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
-          credential_factory.NoAuthCredentialsFactory(),
-          {
-              _InstanceJsonKeys.DICOM_SOURCE: dcm_path,
-          },
+      source_type = (
+          dicom_source_utils.get_dicom_source_type_and_instance_metadata(
+              credential_factory.NoAuthCredentialsFactory(),
+              {
+                  _InstanceJsonKeys.DICOM_SOURCE: dcm_path,
+              },
+              _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
+          )
       )
     self.assertEqual(
         source_type.dicom_source_type,
@@ -321,11 +335,12 @@ class DicomSourceUtilsTest(parameterized.TestCase):
             f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2/instances/{dcm.SOPInstanceUID}'
         )
       with self.assertRaises(data_accessor_errors.DicomError):
-        dicom_source_utils.get_dicom_source_type(
+        dicom_source_utils.get_dicom_source_type_and_instance_metadata(
             credential_factory.NoAuthCredentialsFactory(),
             {
                 _InstanceJsonKeys.DICOM_SOURCE: dcm_path,
             },
+            _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
         )
 
   def test_discover_ct_series_instances(self):
@@ -339,13 +354,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           dcm.StudyInstanceUID = '1.1'
           dcm.SeriesInstanceUID = '1.2'
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
+      source_type = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
           credential_factory.NoAuthCredentialsFactory(),
           {
               _InstanceJsonKeys.DICOM_SOURCE: (
                   f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2'
               ),
           },
+          _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
       )
       self.assertEqual(
           source_type.dicom_source_type,
@@ -366,13 +382,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           dcm.StudyInstanceUID = '1.1'
           dcm.SeriesInstanceUID = '1.2'
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
+      source_type = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
           credential_factory.NoAuthCredentialsFactory(),
           {
               _InstanceJsonKeys.DICOM_SOURCE: (
                   f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2'
               ),
           },
+          _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
       )
       self.assertEqual(
           source_type.dicom_source_type,
@@ -393,13 +410,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           dcm.StudyInstanceUID = '1.1'
           dcm.SeriesInstanceUID = '1.2'
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
+      source_type = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
           credential_factory.NoAuthCredentialsFactory(),
           {
               _InstanceJsonKeys.DICOM_SOURCE: (
                   f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2'
               ),
           },
+          _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
       )
       self.assertEqual(
           source_type.dicom_source_type,
@@ -420,13 +438,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           dcm.StudyInstanceUID = '1.1'
           dcm.SeriesInstanceUID = '1.2'
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
+      source_type = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
           credential_factory.NoAuthCredentialsFactory(),
           {
               _InstanceJsonKeys.DICOM_SOURCE: (
                   f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2'
               ),
           },
+          _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
       )
       self.assertEqual(
           source_type.dicom_source_type,
@@ -450,13 +469,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           else:
             del dcm['ImagePositionPatient']
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
+      source_type = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
           credential_factory.NoAuthCredentialsFactory(),
           {
               _InstanceJsonKeys.DICOM_SOURCE: (
                   f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2'
               ),
           },
+          _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
       )
       self.assertEqual(
           source_type.dicom_source_type,
@@ -482,13 +502,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           else:
             dcm.AcquisitionNumber = 2
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
+      source_type = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
           credential_factory.NoAuthCredentialsFactory(),
           {
               _InstanceJsonKeys.DICOM_SOURCE: (
                   f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2'
               ),
           },
+          _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
       )
       self.assertEqual(
           source_type.dicom_source_type,
@@ -510,13 +531,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           dcm.SOPInstanceUID = str(index)
           dcm.AcquisitionDateTime = f'20240130{index:0>2}000000'
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
+      source_type = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
           credential_factory.NoAuthCredentialsFactory(),
           {
               _InstanceJsonKeys.DICOM_SOURCE: (
                   f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2'
               ),
           },
+          _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
       )
       self.assertEqual(
           source_type.dicom_source_type,
@@ -542,13 +564,14 @@ class DicomSourceUtilsTest(parameterized.TestCase):
           dcm.AcquisitionDate = f'202401{index:0>2}'
           dcm.AcquisitionTime = f'{index:0>2}'
           dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
-      source_type = dicom_source_utils.get_dicom_source_type(
+      source_type = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
           credential_factory.NoAuthCredentialsFactory(),
           {
               _InstanceJsonKeys.DICOM_SOURCE: (
                   f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2'
               ),
           },
+          _NO_MAX_SLICES_LIMIT_IN_RADIOLOGY_VOLUMES,
       )
       self.assertEqual(
           source_type.dicom_source_type,
@@ -558,6 +581,49 @@ class DicomSourceUtilsTest(parameterized.TestCase):
       self.assertEqual(
           source_type.dicom_instances_metadata[0].sop_instance_uid, '0'
       )
+
+  @parameterized.parameters(range(0, 10))
+  def test_cs_series_clip_ct_slice_number_by_max_limit(
+      self, max_slices_limit: int
+  ):
+    with dicom_store_mock.MockDicomStores(
+        _MOCK_DICOM_STORE_PATH
+    ) as dicom_store:
+      for index in range(10):
+        with pydicom.dcmread(
+            test_utils.testdata_path('ct', 'test_series', f'image{index}.dcm')
+        ) as dcm:
+          dcm.StudyInstanceUID = '1.1'
+          dcm.SeriesInstanceUID = '1.2'
+          dcm.InstanceNumber = index
+          dcm.ImagePositionPatient = [index, 2, 2]
+          dcm.SOPInstanceUID = str(index)
+          dcm.AcquisitionDate = f'202401{index:0>2}'
+          dcm.AcquisitionTime = f'{index:0>2}'
+          dicom_store[_MOCK_DICOM_STORE_PATH].add_instance(dcm)
+      source_type = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
+          credential_factory.NoAuthCredentialsFactory(),
+          {
+              _InstanceJsonKeys.DICOM_SOURCE: (
+                  f'{_MOCK_DICOM_STORE_PATH}/studies/1.1/series/1.2'
+              ),
+          },
+          max_slices_limit,
+      )
+      self.assertEqual(
+          source_type.dicom_source_type,
+          dicom_source_utils.DicomDataSourceEnum.GENERIC_DICOM,
+      )
+      self.assertLen(source_type.dicom_instances_metadata, max_slices_limit)
+      expected_instance_numbers = [
+          str(int(round(i / max_slices_limit * 9)))
+          for i in range(1, max_slices_limit + 1)
+      ]
+      self.assertEqual(
+          [m.sop_instance_uid for m in source_type.dicom_instances_metadata],
+          expected_instance_numbers,
+      )
+
 
 if __name__ == '__main__':
   absltest.main()
