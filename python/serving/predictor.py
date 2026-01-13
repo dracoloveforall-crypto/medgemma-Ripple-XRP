@@ -63,6 +63,10 @@ from serving.logging_lib import cloud_logging_client
 INSTANCES_KEY = 'instances'
 PREDICTIONS_KEY = 'predictions'
 
+# Number of images at which it is faster to encode PNG images in parallel using
+# a process pool instead of serially on single cpu.
+_PNG_PROCESS_POOL_THRESHOLD = 20
+
 _DICOM_CT_OR_MRI_VOLUME_DATA_SOURCES = (
     abstract_data_accessor.AccessorDataSource.DICOM_CT_VOLUME,
     abstract_data_accessor.AccessorDataSource.DICOM_MRI_VOLUME,
@@ -139,6 +143,21 @@ def _cast_and_validate_bool(val: Any) -> bool:
   raise json_validation_utils.ValidationError('not bool')
 
 
+def _get_worker_parallelism_method() -> (
+    abstract_data_accessor.AccessorWorkerParallelismMethod
+):
+  """Returns worker type."""
+  match flags.WORKER_DOWNLOAD_PARALLELISM.value:
+    case 'THREAD':
+      return abstract_data_accessor.AccessorWorkerParallelismMethod.THREAD
+    case 'PROCESS':
+      return abstract_data_accessor.AccessorWorkerParallelismMethod.PROCESS
+    case _:
+      raise data_accessor_errors.InvalidRequestFieldError(
+          'Unsupported worker type.'
+      )
+
+
 def _parse_image_content(
     config: dicom_wsi_configuration.ConfigurationSettings,
     instance: Mapping[str, Any],
@@ -195,7 +214,10 @@ def _parse_image_content(
       return http_image_data_accessor.HttpImageData(
           parsed_instance,
           _get_local_file_handlers(),
-          max_parallel_download_workers=config.max_parallel_download_workers,
+          config=abstract_data_accessor.DataAccessorConfig(
+              max_parallel_download_workers=config.max_parallel_download_workers,
+              worker_parallelism_method=_get_worker_parallelism_method(),
+          ),
       )
     # support MedGemma internal chat syntax.
     case predictor_const.IMAGE_TYPE_MEDGEMMA_INTERNAL:
@@ -211,7 +233,9 @@ def _parse_image_content(
       return http_image_data_accessor.HttpImageData(
           parsed_instance,
           _get_local_file_handlers(),
-          max_parallel_download_workers=config.max_parallel_download_workers,
+          config=abstract_data_accessor.DataAccessorConfig(
+              max_parallel_download_workers=config.max_parallel_download_workers,
+          ),
       )
     # support GCS.
     case predictor_const.IMAGE_TYPE_GCS:
@@ -236,7 +260,10 @@ def _parse_image_content(
           parsed_instance,
           _get_local_file_handlers(),
           _GCS_DOWNLOAD_THREAD_COUNT,
-          max_parallel_download_workers=config.max_parallel_download_workers,
+          config=abstract_data_accessor.DataAccessorConfig(
+              max_parallel_download_workers=config.max_parallel_download_workers,
+              worker_parallelism_method=_get_worker_parallelism_method(),
+          ),
       )
     # support DICOM.
     case predictor_const.IMAGE_TYPE_DICOM:
@@ -253,9 +280,7 @@ def _parse_image_content(
           dicom_record.get(predictor_const.BEARER_TOKEN, '')
       )
       result = dicom_source_utils.get_dicom_source_type_and_instance_metadata(
-          auth,
-          dicom_record,
-          flags.MAX_NUMBER_OF_SLICES_IN_RADIOLOGY_VOLUME_FLAG.value,
+          auth, dicom_record
       )
       # if slide microscope image
       if (
@@ -286,7 +311,10 @@ def _parse_image_content(
       )
       return dicom_generic_data_accessor.DicomGenericData(
           parsed_instance,
-          max_parallel_download_workers=config.max_parallel_download_workers,
+          config=abstract_data_accessor.DataAccessorConfig(
+              max_parallel_download_workers=config.max_parallel_download_workers,
+              worker_parallelism_method=_get_worker_parallelism_method(),
+          ),
       )
     case _:
       raise data_accessor_errors.InvalidRequestFieldError(
@@ -555,7 +583,7 @@ class _MedGemmaPredictionRequest:
           acquision_data_source = data_source.acquision_data_source
           if acquision_data_source not in _DICOM_CT_OR_MRI_VOLUME_DATA_SOURCES:
             for img in data_source.acquision_data_source_iterator:
-              images.append(_encode_image_bytes(img))
+              images.append(img)
               revised_content.append(entry)
             continue
           for slice_index, img in enumerate(
@@ -566,7 +594,7 @@ class _MedGemmaPredictionRequest:
               revised_content.append(
                   _dicom_ct_or_mri_volume_slice_index_text_entry(1)
               )
-            images.append(_encode_image_bytes(img))
+            images.append(img)
             revised_content.append(entry)
             if slice_index == 1:
               continue
@@ -589,6 +617,22 @@ class _MedGemmaPredictionRequest:
         'return_num_output_tokens': np.array([1], dtype=np.bool_),
     }
     if images:
+      if (
+          len(images) > _PNG_PROCESS_POOL_THRESHOLD
+          and flags.WORKER_DOWNLOAD_PARALLELISM.value == 'PROCESS'
+          and 'png' in flags.IMAGE_INPUT_COMPRESSION_FORMAT_FLAG.value.lower()
+      ):
+        # For PNG compression using a process pool is faster when
+        # number of images > 20 at ~100 pool is ~1 sec faster
+        # Thresholds emperically determined.
+        # For JPEG compression, process pool is slower in most cases and
+        # offers negligible speed gains (~40 ms) when number of images is large.
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=5
+        ) as thread_pool:
+          images = list(thread_pool.map(_encode_image_bytes, images))
+      else:
+        images = list(map(_encode_image_bytes, images))
       input_map['image'] = np.array(images, dtype=np.object_)
     return input_map
 
@@ -702,7 +746,9 @@ class _ModelPredictor:
       request: _MedGemmaPredictionRequest,
   ) -> Union[
       _MedGemmaPredictionResults,
-      Sequence[data_accessor_errors.DataAccessorError],
+      Sequence[
+          data_accessor_errors.DataAccessorError | model_runner.ModelError
+      ],
   ]:
     """Get imaging in parallel and then run ML model once."""
     start_time = time.time()
@@ -717,15 +763,18 @@ class _ModelPredictor:
       # generate text input from med gemma prediction.
       # model execution parameters
       # call medgemma and return response.
-      result = model.run_model_multiple_output(
-          model_input=request.model_input(self._prompt_converter),
-          parameters=request.parameters.to_dict(),
-          model_output_keys={
-              'text_output',
-              'num_input_tokens',
-              'num_output_tokens',
-          },
-      )
+      try:
+        result = model.run_model_multiple_output(
+            model_input=request.model_input(self._prompt_converter),
+            parameters=request.parameters.to_dict(),
+            model_output_keys={
+                'text_output',
+                'num_input_tokens',
+                'num_output_tokens',
+            },
+        )
+      except model_runner.ModelError as e:
+        return [e]
 
     cloud_logging_client.info(
         f'Called embedding model; {time.time() - start_time} (sec).'
@@ -766,10 +815,18 @@ def _instance_response(
 
 
 def _prediction_error_response(
-    ds_error: data_accessor_errors.DataAccessorError,
+    ds_error: data_accessor_errors.DataAccessorError | model_runner.ModelError,
 ) -> Mapping[str, Any]:
+  """Returns a JSON-serializable error response for prediction exceptions."""
+  if isinstance(ds_error, model_runner.ModelError):
+    message = str(ds_error)
+  elif isinstance(ds_error, data_accessor_errors.DataAccessorError):
+    message = ds_error.api_description
+  else:
+    # Internal error should never be raised.
+    raise ValueError(f'Unsupported error type: {type(ds_error)}')
   error = {
-      'message': ds_error.api_description[:_MAX_ERROR_DESCRIPTION_LENGTH],
+      'message': message[:_MAX_ERROR_DESCRIPTION_LENGTH],
       'object': predictor_const.ERROR,
       # 'type': ds_error.error_code.category,
   }

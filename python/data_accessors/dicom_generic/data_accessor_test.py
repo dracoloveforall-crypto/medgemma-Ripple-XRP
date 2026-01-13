@@ -26,6 +26,7 @@ import numpy as np
 import pydicom
 import requests_mock
 
+from data_accessors import abstract_data_accessor
 from data_accessors import data_accessor_const
 from data_accessors import data_accessor_errors
 from data_accessors.dicom_generic import data_accessor
@@ -246,7 +247,9 @@ class DataAccessorTest(parameterized.TestCase):
         )
         data_accessor_instance = data_accessor.DicomGenericData(
             instance,
-            max_parallel_download_workers=max_parallel_download_workers,
+            config=abstract_data_accessor.DataAccessorConfig(
+                max_parallel_download_workers=max_parallel_download_workers,
+            ),
         )
         with contextlib.ExitStack() as stack:
           data_accessor_instance.load_data(stack)

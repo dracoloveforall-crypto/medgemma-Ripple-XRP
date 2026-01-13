@@ -25,14 +25,17 @@ from serving.logging_lib.flags import flag_utils
 
 # Endpoint configuration flags.
 
-MAX_NUMBER_OF_SLICES_IN_RADIOLOGY_VOLUME_FLAG = flags.DEFINE_integer(
-    'max_number_of_slices_in_radiology_volume', 85,
-    'max number of slices in a radiology CT or MRI volume; -1 means no limit.',
+WORKER_DOWNLOAD_PARALLELISM = flags.DEFINE_enum(
+    'worker_download_parallelism',
+    'PROCESS',
+    ['THREAD', 'PROCESS'],
+    'Worker type to use when downloading instance data.',
 )
+
 
 MAX_PARALLEL_DOWNLOAD_WORKERS_FLAG = flags.DEFINE_integer(
     'max_parallel_download_workers',
-    int(os.environ.get('MAX_PARALLEL_DOWNLOAD_WORKERS', 2)),
+    int(os.environ.get('MAX_PARALLEL_DOWNLOAD_WORKERS', 3)),
     'Max number of parallel workers to use when downloading instance data.',
 )
 

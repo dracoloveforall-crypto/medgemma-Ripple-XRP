@@ -25,6 +25,9 @@ from typing import Any
 import numpy as np
 
 
+class ModelError(Exception):
+  """Error running model."""
+
 class ModelRunner(abc.ABC):
   """Runs a model with tensor inputs and outputs."""
 
@@ -50,6 +53,9 @@ class ModelRunner(abc.ABC):
 
     Returns:
       A mapping of model output keys to tensors.
+
+    Raises:
+      ModelError: If an error occurs during model execution.
     """
 
   def run_model(
@@ -73,6 +79,9 @@ class ModelRunner(abc.ABC):
 
     Returns:
       The single output tensor.
+
+    Raises:
+      ModelError: If an error occurs during model execution.
     """
     return self.run_model_multiple_output(
         model_input,
@@ -103,6 +112,9 @@ class ModelRunner(abc.ABC):
 
     Returns:
       A list of the single output tensor from each input.
+
+    Raises:
+      ModelError: If an error occurs during model execution.
     """
     return [
         self.run_model(
@@ -137,6 +149,9 @@ class ModelRunner(abc.ABC):
     Returns:
       A list containing the mapping of model output keys to tensors from each
       input.
+
+    Raises:
+      ModelError: If an error occurs during model execution.
     """
     return [
         self.run_model_multiple_output(

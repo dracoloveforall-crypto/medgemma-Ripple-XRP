@@ -143,7 +143,8 @@ class TritonStreamingServerModelRunner(model_runner.ModelRunner):
           "Model server request was cancelled. This may be due to the server"
           " shutting down or an internal asyncio error."
       ) from e
-
+    except triton_utils.InferenceServerException as e:
+      raise model_runner.ModelError(f"Error running model: {str(e)}") from e
     assert result is not None  # infer never returns None, despite annotation.
 
     outputs = {key: result.as_numpy(key) for key in model_output_keys}

@@ -214,25 +214,12 @@ def _sort_by_slice_position(obj: dicom_web_interface.DicomObject) -> int:
     return 0
 
 
-def _clip_dicom_slices(
-    dicom_slices: Sequence[dicom_web_interface.DicomObject],
-    max_dicom_slices: int,
-) -> Sequence[dicom_web_interface.DicomObject]:
-  """Clips slices uniformly across the volume, assumes equal slice spacing."""
-  number_of_slices = len(dicom_slices) - 1
-  return [
-      dicom_slices[int(round(i / max_dicom_slices * number_of_slices))]
-      for i in range(1, max_dicom_slices + 1)
-  ]
-
-
 def _identify_dicom_series_instances_for_single_ct_or_mri_volume(
     dicom_series_metadata: Sequence[dicom_web_interface.DicomObject],
-    max_ct_mri_dicom_slices: int,
 ) -> Sequence[dicom_web_interface.DicomObject]:
   """Identifies DICOM series instances for a single CT or MRI volume."""
   dicom_series_metadata = _filter_image_type(dicom_series_metadata)
-  dicom_series_metadata = _filter_acquisition_number(dicom_series_metadata, )
+  dicom_series_metadata = _filter_acquisition_number(dicom_series_metadata)
   dicom_series_metadata, metadata_no_slice_position = (
       _split_instances_by_dicom_tag(
           dicom_series_metadata, tags.IMAGE_POSITION_PATIENT
@@ -243,16 +230,10 @@ def _identify_dicom_series_instances_for_single_ct_or_mri_volume(
       if dicom_series_metadata
       else metadata_no_slice_position
   )
-  dicom_slices = sorted(
+  return sorted(
       dicom_series_metadata,
       key=_sort_by_slice_position,
   )
-  if (
-      max_ct_mri_dicom_slices >= 0
-      and len(dicom_slices) > max_ct_mri_dicom_slices
-  ):
-    dicom_slices = _clip_dicom_slices(dicom_slices, max_ct_mri_dicom_slices)
-  return dicom_slices
 
 
 #  End: Utility functions to identify a single CT or MRI volume
@@ -326,15 +307,12 @@ def infer_modality_from_sop_class_uid(sop_class_uid: str) -> str:
 def get_dicom_source_type_and_instance_metadata(
     auth: credential_factory.AbstractCredentialFactory,
     instance: Mapping[str, Any],
-    max_ct_mri_dicom_slices: int,
 ) -> _DicomSourceType:
   """Returns DICOM modality and instnace metadata for requested path.
 
   Args:
     auth: Authentication credentials for DICOMweb access.
     instance: A JSON encoded DICOMweb instance.
-    max_ct_mri_dicom_slices: Maximum number of DICOM slices for CT or MRI
-      volume.
 
   Returns:
     A _DicomSourceType object containing the DICOM data source type and the
@@ -416,7 +394,7 @@ def get_dicom_source_type_and_instance_metadata(
     # if CT or MRI volume then identify single volume is defined by series.
     # Identify set of instances that define a single CT or MRI volume.
     instances = _identify_dicom_series_instances_for_single_ct_or_mri_volume(
-        instances, max_ct_mri_dicom_slices
+        instances
     )
 
   if path_defined_sop_instances:

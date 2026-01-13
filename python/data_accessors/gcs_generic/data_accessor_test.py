@@ -27,6 +27,7 @@ import google.auth.credentials
 import numpy as np
 import PIL.Image
 
+from data_accessors import abstract_data_accessor
 from data_accessors import data_accessor_const
 from data_accessors import data_accessor_errors
 from data_accessors.gcs_generic import data_accessor
@@ -508,7 +509,9 @@ class DataAccessorTest(parameterized.TestCase):
               generic_dicom_handler.GenericDicomHandler(),
           ],
           download_worker_count=1,
-          max_parallel_download_workers=max_parallel_download_workers,
+          config=abstract_data_accessor.DataAccessorConfig(
+              max_parallel_download_workers=max_parallel_download_workers,
+          ),
       )
       with contextlib.ExitStack() as stack:
         gcs_data_accessor.load_data(stack)
@@ -580,7 +583,9 @@ class DataAccessorTest(parameterized.TestCase):
               generic_dicom_handler.GenericDicomHandler(),
           ],
           download_worker_count=1,
-          max_parallel_download_workers=max_parallel_download_workers,
+          config=abstract_data_accessor.DataAccessorConfig(
+              max_parallel_download_workers=max_parallel_download_workers,
+          ),
       )
       shutil.copyfile(
           test_utils.testdata_path('cxr', 'encapsulated_cxr.dcm'),

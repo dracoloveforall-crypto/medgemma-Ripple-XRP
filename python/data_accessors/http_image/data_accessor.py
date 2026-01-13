@@ -14,13 +14,12 @@
 """Data accessor for generic DICOM images stored in a DICOM store."""
 
 import base64
-from concurrent import futures
 import contextlib
 import functools
 import os
 import re
 import tempfile
-from typing import Iterator, Sequence
+from typing import Iterator, Optional, Sequence
 
 from ez_wsi_dicomweb import error_retry_util
 import numpy as np
@@ -66,7 +65,7 @@ def _retry_http_image_download(
 def _download_http_images(
     stack: contextlib.ExitStack,
     instance: data_accessor_definition.HttpImage,
-    max_parallel_download_workers: int,
+    config: abstract_data_accessor.DataAccessorConfig,
 ) -> Sequence[str]:
   """Downloads DICOM instance to a local file."""
   temp_dir = stack.enter_context(tempfile.TemporaryDirectory())
@@ -85,13 +84,12 @@ def _download_http_images(
       continue
     http_download_list.append((url, local_filename))
     local_filenames.append(local_filename)
+  max_parallel_download_workers = max(config.max_parallel_download_workers, 1)
   if len(http_download_list) == 1 or max_parallel_download_workers == 1:
     for http_download in http_download_list:
       _retry_http_image_download(instance, http_download)
   elif len(http_download_list) > 1:
-    with futures.ThreadPoolExecutor(
-        max_workers=max_parallel_download_workers
-    ) as executor:
+    with config.get_worker_executor() as executor:
       list(
           executor.map(
               functools.partial(_retry_http_image_download, instance),
@@ -112,12 +110,16 @@ class HttpImageData(
       self,
       instance_class: data_accessor_definition.HttpImage,
       file_handlers: Sequence[abstract_handler.AbstractHandler],
-      max_parallel_download_workers: int = 1,
+      config: Optional[abstract_data_accessor.DataAccessorConfig] = None,
   ):
     super().__init__(instance_class)
     self._file_handlers = file_handlers
     self._local_file_paths = []
-    self._max_parallel_download_workers = max(1, max_parallel_download_workers)
+    self._config = (
+        config
+        if config is not None
+        else (abstract_data_accessor.DataAccessorConfig())
+    )
 
   @contextlib.contextmanager
   def _reset_local_file_paths(self, *args, **kwds):
@@ -142,7 +144,7 @@ class HttpImageData(
     if self._local_file_paths:
       return
     self._local_file_paths = _download_http_images(
-        stack, self.instance, self._max_parallel_download_workers
+        stack, self.instance, self._config
     )
     stack.enter_context(self._reset_local_file_paths())
 
@@ -154,7 +156,7 @@ class HttpImageData(
         local_file_paths = self._local_file_paths
       else:
         local_file_paths = _download_http_images(
-            stack, self.instance, self._max_parallel_download_workers
+            stack, self.instance, self._config
         )
       yield from abstract_handler.process_files_with_handlers(
           self._file_handlers,

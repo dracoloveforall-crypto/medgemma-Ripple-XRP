@@ -14,13 +14,41 @@
 """Defines abstract representation for accessing data referenced in a request."""
 
 import abc
+from concurrent import futures
 import contextlib
 import dataclasses
 import enum
-from typing import Generic, Iterator, TypeVar
+from typing import Generic, Iterator, TypeVar, Union
 
 InstanceDataClass = TypeVar('InstanceDataClass')
 InstanceDataType = TypeVar('InstanceDataType')
+
+
+class AccessorWorkerParallelismMethod(enum.Enum):
+  THREAD = 'THREAD'
+  PROCESS = 'PROCESS'
+
+
+@dataclasses.dataclass(frozen=True)
+class DataAccessorConfig:
+  max_parallel_download_workers: int = 1
+  worker_parallelism_method: AccessorWorkerParallelismMethod = (
+      AccessorWorkerParallelismMethod.THREAD
+  )
+
+  def get_worker_executor(
+      self
+  ) -> Union[futures.ThreadPoolExecutor, futures.ProcessPoolExecutor]:
+    max_parallel_download_workers = max(self.max_parallel_download_workers, 1)
+    match self.worker_parallelism_method:
+      case AccessorWorkerParallelismMethod.THREAD:
+        return futures.ThreadPoolExecutor(
+            max_workers=max_parallel_download_workers
+        )
+      case AccessorWorkerParallelismMethod.PROCESS:
+        return futures.ProcessPoolExecutor(
+            max_workers=max_parallel_download_workers
+        )
 
 
 class AccessorDataSource(enum.Enum):

@@ -26,6 +26,7 @@ import numpy as np
 import PIL.Image
 import requests_mock
 
+from data_accessors import abstract_data_accessor
 from data_accessors import data_accessor_const
 from data_accessors import data_accessor_errors
 from data_accessors.http_image import data_accessor
@@ -60,7 +61,9 @@ def _test_load_from_http(
     http_data_accessor = data_accessor.HttpImageData(
         instance,
         file_handlers=file_handlers,
-        max_parallel_download_workers=max_parallel_download_workers,
+        config=abstract_data_accessor.DataAccessorConfig(
+            max_parallel_download_workers=max_parallel_download_workers,
+        ),
     )
     return list(http_data_accessor.data_iterator())
 
@@ -488,7 +491,9 @@ class DataAccessorTest(parameterized.TestCase):
               generic_dicom_handler.GenericDicomHandler(),
               traditional_image_handler.TraditionalImageHandler(),
           ],
-          max_parallel_download_workers=max_parallel_download_workers,
+          config=abstract_data_accessor.DataAccessorConfig(
+              max_parallel_download_workers=max_parallel_download_workers,
+          ),
       )
       with contextlib.ExitStack() as stack:
         http_data_accessor.load_data(stack)

@@ -18,7 +18,7 @@ import contextlib
 import functools
 import os
 import tempfile
-from typing import Iterator, Sequence
+from typing import Iterator, Optional, Sequence
 
 from ez_wsi_dicomweb import credential_factory as credential_factory_module
 from ez_wsi_dicomweb import error_retry_util
@@ -185,10 +185,11 @@ def _download_gcs_data(
     timeout: int,
     worker_type: str,
     worker_count: int,
-    max_parallel_download_workers: int,
+    config: abstract_data_accessor.DataAccessorConfig,
 ) -> Sequence[str]:
   """Downloads GCS data to a temporary file."""
   base_dir = context.enter_context(tempfile.TemporaryDirectory())
+  max_parallel_download_workers = max(config.max_parallel_download_workers, 1)
   if len(instance.gcs_blobs) == 1 or max_parallel_download_workers <= 1:
     return [
         _download_blob_to_file_exception_wrapper(
@@ -201,9 +202,7 @@ def _download_gcs_data(
         )
         for i, b in enumerate(instance.gcs_blobs)
     ]
-  with futures.ThreadPoolExecutor(
-      max_workers=max_parallel_download_workers
-  ) as executor:
+  with config.get_worker_executor() as executor:
     return list(
         executor.map(
             functools.partial(
@@ -233,14 +232,18 @@ class GcsGenericData(
       download_timeout: int = 600,
       download_worker_type: str = 'process',
       download_worker_count: int = 1,
-      max_parallel_download_workers: int = 1,
+      config: Optional[abstract_data_accessor.DataAccessorConfig] = None,
   ):
     super().__init__(instance_class)
     self._file_handlers = file_handlers
     self._download_timeout = download_timeout
     self._download_worker_type = download_worker_type
     self._download_worker_count = download_worker_count
-    self._max_parallel_download_workers = max(1, max_parallel_download_workers)
+    self._config = (
+        config
+        if config is not None
+        else (abstract_data_accessor.DataAccessorConfig())
+    )
     self._local_file_paths = []
 
   def is_accessor_data_embedded_in_request(self) -> bool:
@@ -275,7 +278,7 @@ class GcsGenericData(
         self._download_timeout,
         self._download_worker_type,
         self._download_worker_count,
-        self._max_parallel_download_workers,
+        self._config,
     )
     stack.enter_context(self._reset_local_file_path())
 
@@ -292,7 +295,7 @@ class GcsGenericData(
             self._download_timeout,
             self._download_worker_type,
             self._download_worker_count,
-            self._max_parallel_download_workers,
+            self._config,
         )
       yield from abstract_handler.process_files_with_handlers(
           self._file_handlers,

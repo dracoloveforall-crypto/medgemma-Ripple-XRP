@@ -13,7 +13,6 @@
 # limitations under the License.
 """Data accessor for generic DICOM images stored in a DICOM store."""
 
-from concurrent import futures
 import contextlib
 import functools
 import os
@@ -85,7 +84,7 @@ def _download_dicom_instance(
 def _download_dicom_instances(
     stack: contextlib.ExitStack,
     instance: data_accessor_definition.DicomGenericImage,
-    max_parallel_download_workers: int,
+    config: abstract_data_accessor.DataAccessorConfig,
 ) -> Sequence[str]:
   """Downloads DICOM instances to a local file."""
   dwi = dicom_web_interface.DicomWebInterface(instance.credential_factory)
@@ -117,6 +116,7 @@ def _download_dicom_instances(
   for i, md in enumerate(selected_md_list):
     instance_list.append((i, md.transfer_syntax_uid, md.sop_instance_uid))
 
+  max_parallel_download_workers = max(config.max_parallel_download_workers, 1)
   if len(instance_list) == 1 or max_parallel_download_workers == 1:
     return [
         _download_dicom_instance(
@@ -127,9 +127,7 @@ def _download_dicom_instances(
         )
         for li in instance_list
     ]
-  with futures.ThreadPoolExecutor(
-      max_workers=max_parallel_download_workers
-  ) as executor:
+  with config.get_worker_executor() as executor:
     return list(
         executor.map(
             functools.partial(
@@ -146,7 +144,7 @@ def _get_dicom_image(
     modality_default_image_transform: Mapping[
         str, generic_dicom_handler.ModalityDefaultImageTransform
     ],
-    max_parallel_download_workers: int,
+    config: abstract_data_accessor.DataAccessorConfig,
 ) -> Iterator[abstract_data_accessor.DataAcquisition[np.ndarray]]:
   """Returns image patch bytes from DICOM series."""
   dicom_handler = generic_dicom_handler.GenericDicomHandler(
@@ -155,9 +153,7 @@ def _get_dicom_image(
   )
   with contextlib.ExitStack() as stack:
     if not local_file_paths:
-      local_file_paths = _download_dicom_instances(
-          stack, instance, max_parallel_download_workers
-      )
+      local_file_paths = _download_dicom_instances(stack, instance, config)
     try:
       yield from dicom_handler.process_files(
           instance.patch_coordinates,
@@ -181,7 +177,7 @@ class DicomGenericData(
       modality_default_image_transform: Optional[
           Mapping[str, generic_dicom_handler.ModalityDefaultImageTransform]
       ] = None,
-      max_parallel_download_workers: int = 1,
+      config: Optional[abstract_data_accessor.DataAccessorConfig] = None,
   ):
     super().__init__(instance_class)
     self._local_file_paths = []
@@ -190,7 +186,11 @@ class DicomGenericData(
         if modality_default_image_transform is not None
         else {}
     )
-    self._max_parallel_download_workers = max(1, max_parallel_download_workers)
+    self._config = (
+        config
+        if config is not None
+        else (abstract_data_accessor.DataAccessorConfig())
+    )
 
   @contextlib.contextmanager
   def _reset_local_file_path(self, *args, **kwds):
@@ -215,7 +215,7 @@ class DicomGenericData(
     if self._local_file_paths:
       return
     self._local_file_paths = _download_dicom_instances(
-        stack, self.instance, self._max_parallel_download_workers
+        stack, self.instance, self._config
     )
     stack.enter_context(self._reset_local_file_path())
 
@@ -226,7 +226,7 @@ class DicomGenericData(
         self.instance,
         self._local_file_paths,
         self._modality_default_image_transform,
-        self._max_parallel_download_workers,
+        self._config,
     )
 
   def is_accessor_data_embedded_in_request(self) -> bool:

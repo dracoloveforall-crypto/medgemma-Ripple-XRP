@@ -410,7 +410,7 @@ components:
               title: SingleUrl
             - type: array
               title: UrlList
-              minItems: 2
+              minItems: 1
               description: List of URLS to images.
               items:
                 type: string
@@ -536,7 +536,7 @@ components:
               description: The URI to a single image file in a Google Cloud Storage (GCS) bucket.
             - type: array
               title: GCSURIList
-              minItems: 2
+              minItems: 1
               description: An array of URIs to image files in a Google Cloud Storage (GCS) bucket.
                 Use it to indicate a **related set of images** like a 3D image or volume. The order
                 of the URIs is important, signifying how the individual images are related to each
@@ -620,7 +620,7 @@ components:
                 processed.
             - type: array
               title: DICOMInstanceURIList
-              minItems: 2
+              minItems: 1
               description: An array of URIs to DICOM SOP Instances on a DICOMweb Store. Use it to
                 indicate a **related set of images**, typically representing a 3D image or volume
                 like a CT scan. The order of the URIs is important, signifying how the individual

@@ -29,6 +29,7 @@ import PIL.Image
 import pydicom
 import requests_mock
 
+from data_accessors import abstract_data_accessor
 from data_accessors import data_accessor_errors
 from data_accessors.dicom_wsi import configuration as dicom_wsi_configuration
 from data_accessors.utils import test_utils
@@ -110,6 +111,9 @@ class DicomDigitalPathologyDataTest(parameterized.TestCase):
             autospec=True,
             side_effect=_mock_base64_encoder,
         )
+    )
+    self.enter_context(
+        flagsaver.flagsaver(worker_download_parallelism='THREAD')
     )
 
   @parameterized.named_parameters(
@@ -1229,6 +1233,27 @@ class ImageEncoderTest(parameterized.TestCase):
         data_accessor_errors.InvalidRequestFieldError, msg
     ):
       predictor._parse_image_content(config, content)
+
+  @parameterized.named_parameters([
+      dict(
+          testcase_name='thread',
+          method='THREAD',
+          expected=abstract_data_accessor.AccessorWorkerParallelismMethod.THREAD,
+      ),
+      dict(
+          testcase_name='process',
+          method='PROCESS',
+          expected=abstract_data_accessor.AccessorWorkerParallelismMethod.PROCESS,
+      ),
+  ])
+  def test_get_worker_parallelism_method(self, method, expected):
+    with flagsaver.flagsaver(worker_download_parallelism=method):
+      self.assertEqual(predictor._get_worker_parallelism_method(), expected)
+
+  def test_get_worker_parallelism_method_unsupported_type_raises_error(self):
+    with flagsaver.flagsaver(worker_download_parallelism='FOO'):
+      with self.assertRaises(data_accessor_errors.InvalidRequestFieldError):
+        predictor._get_worker_parallelism_method()
 
 
 if __name__ == '__main__':
